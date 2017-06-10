@@ -4,7 +4,6 @@
 
 #include <memory>
 #include <chrono>
-#include <random>
 #include <cassert>
 
 #include <atomic>
@@ -760,14 +759,11 @@ namespace concurrencpp {
 
 			template<class ... arguments>
 			void set_result(arguments&& ... args) {
-				{
-					std::lock_guard<spinlock> lock(m_lock);
-					assert(m_state == future_result_state::NOT_READY);
-					new (std::addressof(m_result.result))
-						T(std::forward<arguments>(args)...);
-					m_state = future_result_state::RESULT;
-				}
-
+				std::lock_guard<spinlock> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY);
+				new (std::addressof(m_result.result))
+					T(std::forward<arguments>(args)...);
+				m_state = future_result_state::RESULT;
 				call_continuation();
 			}
 
@@ -777,14 +773,11 @@ namespace concurrencpp {
 			}
 
 			void set_exception(std::exception_ptr exception_pointer) {
-				{
-					std::lock_guard<spinlock> lock(m_lock);
-					assert(m_state == future_result_state::NOT_READY);
-					new (std::addressof(m_result.exception))
-						std::exception_ptr(std::move(exception_pointer));
-					m_state = future_result_state::EXCEPTION;
-				}
-
+				std::lock_guard<spinlock> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY);
+				new (std::addressof(m_result.exception))
+					std::exception_ptr(std::move(exception_pointer));
+				m_state = future_result_state::EXCEPTION;
 				call_continuation();
 			}
 
@@ -841,23 +834,17 @@ namespace concurrencpp {
 		public:
 
 			void set_exception(std::exception_ptr exception_pointer) {
-				{
-					std::lock_guard<spinlock> lock(m_lock);
-					assert(m_state == future_result_state::NOT_READY);
-					m_exception = std::move(exception_pointer);
-					m_state = future_result_state::EXCEPTION;
-				}
-
+				std::lock_guard<spinlock> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY);
+				m_exception = std::move(exception_pointer);
+				m_state = future_result_state::EXCEPTION;
 				call_continuation();
 			}
 
 			void set_result() {
-				{
-					std::lock_guard<spinlock> lock(m_lock);
-					assert(m_state == future_result_state::NOT_READY);
-					m_state = future_result_state::RESULT;
-				}
-
+				std::lock_guard<spinlock> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY);
+				m_state = future_result_state::RESULT;
 				call_continuation();
 			}
 
@@ -921,13 +908,10 @@ namespace concurrencpp {
 			}
 
 			void set_result(T& reference) {
-				{
-					std::lock_guard<spinlock> lock(m_lock);
-					assert(m_state == future_result_state::NOT_READY);
-					m_result.result = std::addressof(reference);
-					m_state = future_result_state::RESULT;
-				}
-
+				std::lock_guard<spinlock> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY);
+				m_result.result = std::addressof(reference);
+				m_state = future_result_state::RESULT;
 				call_continuation();
 			}
 
@@ -937,14 +921,11 @@ namespace concurrencpp {
 			}
 
 			void set_exception(std::exception_ptr exception_pointer) {
-				{
-					std::lock_guard<spinlock> lock(m_lock);
-					assert(m_state == future_result_state::NOT_READY);
-					new (std::addressof(m_result.exception))
-						std::exception_ptr(std::move(exception_pointer));
-					m_state = future_result_state::EXCEPTION;
-				}
-
+				std::lock_guard<spinlock> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY);
+				new (std::addressof(m_result.exception))
+					std::exception_ptr(std::move(exception_pointer));
+				m_state = future_result_state::EXCEPTION;
 				call_continuation();
 			}
 
