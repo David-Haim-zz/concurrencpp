@@ -1,23 +1,23 @@
 /*
-Copyright (c) 2017 David Haim
+	Copyright (c) 2017 David Haim
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+	The above copyright notice and this permission notice shall be included in all
+	copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+	SOFTWARE.
 */
 
 #include <vector>
@@ -366,9 +366,6 @@ namespace concurrencpp {
 
 		};
 	}
-}
-
-namespace concurrencpp {
 
 	template<class T> class future;
 	template<class T> class promise;
@@ -499,8 +496,10 @@ namespace concurrencpp {
 
 			template<class function_type>
 			void enqueue_task(bool self, function_type&& function) {
-				auto task = make_callback(std::forward<function_type>(function));
+				enqueue_task(make_callback(std::forward<function_type>(function)));
+			}
 
+			void enqueue_task(bool self, std::unique_ptr<callback_base> task) {
 				{
 					std::unique_lock<decltype(m_lock)> lock(m_lock);
 					m_tasks.push(std::move(task));
@@ -510,7 +509,6 @@ namespace concurrencpp {
 					m_condition.notify_one();
 				}
 			}
-
 
 			void notify() {
 				m_condition.notify_one();
@@ -589,18 +587,19 @@ namespace concurrencpp {
 
 			template<class function_type>
 			void enqueue_task(function_type&& function) {
+				enqueue_task(make_callback(std::forward<function_type>(function)));
+			}
+
+			void enqueue_task(std::unique_ptr<callback_base> function) {
 				auto self_worker = get_self_worker();
 
 				if (self_worker != nullptr) {
-					self_worker->enqueue_task(
-						true,
-						std::forward<function_type>(function));
+					self_worker->enqueue_task(true, std::move(function));
 					return;
 				}
 
 				const auto index = choose_next_worker();
-				m_workers[index].enqueue_task(false,
-					std::forward<function_type>(function));
+				m_workers[index].enqueue_task(false, std::move(function));
 			}
 
 			static thread_pool& default_instance() {
@@ -639,14 +638,14 @@ namespace concurrencpp {
 		class future_associated_state_base {
 
 		protected:
-			//members are ordered in the order of theur importance.
+			//members are ordered in the order of their importance.
 
 			//mutable spinlock m_lock;
 			mutable std::recursive_mutex m_lock;
 			std::unique_ptr<callback_base> m_then;
 			future_result_state m_state;
 			std::unique_ptr<callback_base> m_deffered;
-			mutable std::unique_ptr<std::condition_variable_any> m_condition;
+			mutable std::unique_ptr<std::condition_variable_any> m_condition; //lazy creation
 
 			void build_condition_object() const {
 				pool_allocator<std::condition_variable_any> allocator;
@@ -696,8 +695,9 @@ namespace concurrencpp {
 					return ::std::future_status::ready;
 				}
 
-				const auto has_result = get_condition().wait_for(lock, duration, [this] {
-					return m_state != future_result_state::NOT_READY;
+				auto& condition = get_condition();
+				const auto has_result = condition.wait_for(lock, duration, [this] {
+					return !(m_state == future_result_state::NOT_READY);
 				});
 
 				return has_result ? std::future_status::ready :
@@ -706,9 +706,9 @@ namespace concurrencpp {
 
 			void wait() {
 				/*
-				According to the standard, only non-timed wait on the future
-				will cause the deffered-function to be launched. this is why
-				this segment is not in wait_for implementation.
+					According to the standard, only non-timed wait on the future
+					will cause the deffered-function to be launched. this is why
+					this segment is not in wait_for implementation.
 				*/
 				if (m_deffered) {
 					m_deffered->execute();
@@ -717,24 +717,23 @@ namespace concurrencpp {
 					return;
 				}
 
-				wait_for(std::chrono::hours(1'000 * 12 * 30 * 24));
+				while (wait_for(std::chrono::hours(365 * 24)) == std::future_status::timeout);
 			}
 
-			template<class continuation_type>
-			void set_continuation(continuation_type&& continuation) {
+			void set_continuation(std::unique_ptr<callback_base> continuation) {
 				{
 					std::unique_lock<decltype(m_lock)> lock(m_lock);
 
 					if (m_state == future_result_state::NOT_READY) {
 						assert(!static_cast<bool>(m_then));
-						m_then = make_callback(std::forward<continuation_type>(continuation));
+						m_then = std::move(continuation);
 						return;
 					}
 				}
 
 				//the future is ready and synchronized (by locking the lock), just call the continuation.
 				//no promise can touch this future again.
-				continuation();
+				continuation->execute();
 			}
 
 			bool has_deffered_task() const noexcept {
@@ -749,6 +748,7 @@ namespace concurrencpp {
 			void call_continuation() {
 				if (static_cast<bool>(m_condition)) {
 					m_condition->notify_all();
+					//do not reset the CV, as other objects wait on it on another thread.
 				}
 
 				if (static_cast<bool>(m_then)) {
@@ -757,6 +757,18 @@ namespace concurrencpp {
 				}
 			}
 
+			void set_deffered_task(std::unique_ptr<callback_base> task) {
+				/*
+					this function should only be called once,
+					by using async + launch::deffered
+				*/
+				std::unique_lock<decltype(m_lock)> lock(m_lock);
+
+				assert(m_state == future_result_state::NOT_READY);
+				assert(!static_cast<bool>(m_deffered));
+
+				m_deffered = std::move(task);
+			}
 		};
 
 		template<class T>
@@ -766,14 +778,6 @@ namespace concurrencpp {
 		private:
 			compressed_future_result<T> m_result;
 
-			void destroy_result() noexcept {
-				m_result.result.~T();
-			}
-
-			void destroy_exception() noexcept {
-				m_result.exception.~exception_ptr();
-			}
-
 		public:
 
 			future_associated_state() noexcept = default;
@@ -782,12 +786,12 @@ namespace concurrencpp {
 				switch (m_state) {
 
 				case future_result_state::RESULT: {
-					destroy_result();
+					m_result.result.~T();
 					return;
 				}
 
 				case future_result_state::EXCEPTION: {
-					destroy_exception();
+					m_result.exception.~exception_ptr();
 					return;
 				}
 
@@ -839,26 +843,20 @@ namespace concurrencpp {
 			}
 
 			template<class function_type>
-			void set_deffered_task(function_type&& function) {
-				/*
-				this function should only be called once,
-				by using async + launch::deffered
-				*/
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-
-				assert(m_state == future_result_state::NOT_READY);
-				assert(!static_cast<bool>(m_deffered));
-
-				m_deffered = make_callback([this, _function = std::forward<function_type>(function)]{
+			static std::unique_ptr<callback_base>
+				make_future_callable(std::shared_ptr<future_associated_state<T>> _this, function_type&& function) {
+				return make_callback([_this = std::move(_this), _function = std::forward<function_type>(function)]() mutable{
 					try {
-					new (std::addressof(m_result.result)) T(_function());
-					m_state = future_result_state::RESULT;
-				}
-				catch (...) {
-					new (std::addressof(m_result.exception))
-						std::exception_ptr(std::current_exception());
-					m_state = future_result_state::EXCEPTION;
-				}
+						new (std::addressof(_this->m_result.result)) T(_function());
+						_this->m_state = future_result_state::RESULT;
+					}
+					catch (...) {
+						new (std::addressof(_this->m_result.exception))
+							std::exception_ptr(std::current_exception());
+						_this->m_state = future_result_state::EXCEPTION;
+					}
+
+					_this->call_continuation();
 				});
 			}
 
@@ -906,26 +904,20 @@ namespace concurrencpp {
 			}
 
 			template<class function_type>
-			void set_deffered_task(function_type&& function) {
-				/*
-				this function should only be called once,
-				by using async + launch::deffered
-				*/
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-
-				assert(m_state == future_result_state::NOT_READY);
-				assert(!static_cast<bool>(m_deffered));
-
-				m_deffered = make_callback([this, _function = std::forward<function_type>(function)]{
+			static std::unique_ptr<callback_base>
+				make_future_callable(std::shared_ptr<future_associated_state<void>> _this, function_type&& function) {
+				return make_callback([_this = std::move(_this), _function = std::forward<function_type>(function)]() mutable{
 					try {
-					_function();
-					m_state = future_result_state::RESULT;
-				}
-				catch (...) {
-					new (std::addressof(m_exception))
-						std::exception_ptr(std::current_exception());
-					m_state = future_result_state::EXCEPTION;
-				}
+						_function();
+						_this->m_state = future_result_state::RESULT;
+					}
+					catch (...) {
+						new (std::addressof(_this->m_exception))
+							std::exception_ptr(std::current_exception());
+						_this->m_state = future_result_state::EXCEPTION;
+					}
+
+					_this->call_continuation();
 				});
 			}
 
@@ -937,17 +929,13 @@ namespace concurrencpp {
 
 			compressed_future_result<T&> m_result;
 
-			void destroy_exception() noexcept {
-				m_result.exception.~exception_ptr();
-			}
-
 		public:
 
 			future_associated_state() noexcept = default;
 
 			~future_associated_state() noexcept {
 				if (m_state == future_result_state::EXCEPTION) {
-					destroy_exception();
+					m_result.exception.~exception_ptr();
 				}
 			}
 
@@ -991,90 +979,25 @@ namespace concurrencpp {
 
 			T& get() {
 				wait();
-				return result_or_exception();
+				return result_or_exception_unlocked();
 			}
 
 			template<class function_type>
-			void set_deffered_task(function_type&& function) {
-				/*
-				this function should only be called once,
-				by using async + launch::deffered
-				*/
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-
-				assert(m_state == future_result_state::NOT_READY);
-				assert(!static_cast<bool>(m_deffered));
-
-				m_deffered = make_callback([this, _function = std::forward<function_type>(function)]{
+			static std::unique_ptr<callback_base>
+				make_future_callable(std::shared_ptr<future_associated_state<T&>> _this, function_type&& function) {
+				return make_callback([_this = std::move(_this), _function = std::forward<function_type>(function)]() mutable{
 					try {
-					m_result.result = std::addressof(_function());
-					m_state = future_result_state::RESULT;
-				}
-				catch (...) {
-					new (std::addressof(m_result.exception))
-						std::exception_ptr(std::current_exception());
-					m_state = future_result_state::EXCEPTION;
-				}
+						_this->m_result.result = std::addressof(_function());
+						_this->m_state = future_result_state::RESULT;
+					}
+					catch (...) {
+						new (std::addressof(_this->m_result.exception))
+							std::exception_ptr(std::current_exception());
+						_this->m_state = future_result_state::EXCEPTION;
+					}
+
+					_this->call_continuation();
 				});
-			}
-
-		};
-
-		/*
-		This class SFINAEs the continuation functions set with
-		future::then. depending on the continuation, a future<T/T&/void>
-		should be returned. this class handles wiring the future with
-		the continuation.
-		*/
-		template<class function, class inner_type, class outer_type>
-		class future_continuation {
-
-		private:
-			function m_function;
-			std::shared_ptr<future_associated_state<inner_type>> m_old_state;
-			std::shared_ptr<future_associated_state<outer_type>> m_new_state;
-
-			/*
-			Is the continuation returns void? if so
-			a diffrent treatment should be applied
-			*/
-			using is_void = typename std::conditional_t<
-				std::is_same<outer_type, void>::value,
-				std::true_type,
-				std::false_type>;
-
-			void continue_impl(std::false_type is_void) noexcept {
-				try {
-					m_new_state->set_result(m_function(future<inner_type>(m_old_state)));
-				}
-				catch (...) {
-					m_new_state->set_exception(std::current_exception());
-				}
-			}
-
-			void continue_impl(std::true_type is_void) noexcept {
-				try {
-					m_function(future<inner_type>(m_old_state));
-					m_new_state->set_result();
-				}
-				catch (...) {
-					m_new_state->set_exception(std::current_exception());
-				}
-			}
-
-
-		public:
-
-			future_continuation(
-				function given_function,
-				decltype(m_old_state) old_state,
-				decltype(m_new_state) new_state) :
-				m_function(std::forward<function>(given_function)),
-				m_old_state(std::move(old_state)),
-				m_new_state(std::move(new_state)) {}
-
-			void operator() () noexcept {
-				continue_impl(is_void());
 			}
 
 		};
@@ -1096,56 +1019,30 @@ namespace concurrencpp {
 			return state_holder.m_state;
 		}
 
+		template<class T>
+		struct unwrapped_type {
+			using type = T;
+		};
+
+		template<class T>
+		struct unwrapped_type<concurrencpp::future<T>> {
+			using type = T;
+		};
+
 		template<class T, class scheduler_type>
 		struct async_impl {
 
 			template<class F>
 			inline static future<T> do_async(F&& task) {
-				future<T> future;
 				pool_allocator<future_associated_state<T>> allocator;
-				auto& inner_future_state = get_inner_state(future); //avoid the memory/cpu overhead of promise.
-				inner_future_state =
+				auto future_state =
 					std::allocate_shared<future_associated_state<T>>(allocator);
-				scheduler_type scheduler;
+				auto future_task =
+					future_associated_state<T>::make_future_callable(future_state, std::forward<F>(task));
 
-				scheduler([future_state = inner_future_state, task = std::forward<F>(task)]() mutable{
-					try {
-						future_state->set_result(task());
-					}
-					catch (...) {
-						future_state->set_exception(std::current_exception());
-					}
-				});
-
-				return future;
+				scheduler_type::schedule(std::move(future_task), future_state.get());
+				return future_state;
 			}
-		};
-
-		template<class scheduler_type>
-		struct async_impl<void, scheduler_type> {
-
-			template<class F>
-			inline static future<void> do_async(F&& task) {
-				future<void> future;
-				pool_allocator<future_associated_state<void>> allocator;
-				auto& inner_future_state = get_inner_state(future); //avoid the memory/cpu overhead of promise.
-				inner_future_state =
-					std::allocate_shared<future_associated_state<void>>(allocator);
-				scheduler_type scheduler;
-
-				scheduler([future_state = inner_future_state, task = std::forward<F>(task)]() mutable{
-					try {
-						task();
-						future_state->set_result();
-					}
-					catch (...) {
-						future_state->set_exception(std::current_exception());
-					}
-				});
-
-				return future;
-			}
-
 		};
 
 		template<class T, class scheduler_type>
@@ -1153,26 +1050,26 @@ namespace concurrencpp {
 
 			template<class F>
 			static inline future<T> do_async(F&& task) {
-				future<T> future;
 				pool_allocator<future_associated_state<T>> allocator;
-				auto& inner_future_state = get_inner_state(future); //avoid the memory/cpu overhead of promise.
-				inner_future_state =
+				auto future_state =
 					std::allocate_shared<future_associated_state<T>>(allocator);
-				scheduler_type scheduler;
 
-				scheduler([future_state = inner_future_state, task = std::forward<F>(task)]()mutable->void{
-					auto future = task();
-					future.then([future_state = std::move(future_state)](auto done_future){
-						try {
-							future_state->set_result(done_future.get());
-						}
-						catch (...) {
-							future_state->set_exception(std::current_exception());
-						}
+				auto bridge_task = make_callback([
+					future_state = future_state,
+						task = std::forward<F>(task)]() mutable {
+						auto future = task();
+						future.then([future_state = std::move(future_state)](auto done_future){
+							try {
+								future_state->set_result(done_future.get());
+							}
+							catch (...) {
+								future_state->set_exception(std::current_exception());
+							}
+						});
 					});
-				});
 
-				return future;
+				scheduler_type::schedule(std::move(bridge_task), future_state.get());
+				return future_state;
 			}
 		};
 
@@ -1181,53 +1078,55 @@ namespace concurrencpp {
 
 			template<class F>
 			static inline future<void> do_async(F&& task) {
-				future<void> future;
-				pool_allocator<future_associated_state<void>> allocator;
-				auto& inner_future_state = get_inner_state(future); //avoid the memory/cpu overhead of promise.
-				inner_future_state =
-					std::allocate_shared<future_associated_state<void>>(allocator);
-				scheduler_type scheduler;
+				pool_allocator<future_associated_state<T>> allocator;
+				auto future_state =
+					std::allocate_shared<future_associated_state<T>>(allocator);
 
-				schedule([future_state = std::move(inner_future_state), task = std::forward<F>(task)]()mutable -> void{
-					auto future = task();
-					future.then([future_state = std::move(future_state)](auto done_future){
-						try {
-							done_future.get();
-							future_state->set_result();
-						}
-						catch (...) {
-							future_state->set_exception(std::current_exception());
-						}
+				auto bridge_task = make_callback([
+					future_state = future_state,
+						task = std::forward<F>(task)]() mutable -> void{
+						auto future = task();
+						future.then([future_state = std::move(future_state)](auto done_future){
+							try {
+								done_future.get();
+								future_state->set_result();
+							}
+							catch (...) {
+								future_state->set_exception(std::current_exception());
+							}
+						});
 					});
-				});
 
-				return future;
+				scheduler_type::schedule(std::move(bridge_task), future_state.get());
+
+				return future_state;
 			}
 		};
 
-		template<class result_type, class function_type, class ... arguments>
-		future<result_type> deffered_async_impl(function_type&& function, arguments&& ... args) {
-			future<result_type> future;
-			pool_allocator<future_associated_state<result_type>> allocator;
-			auto& state = get_inner_state(future);
-			state =
-				std::allocate_shared<future_associated_state<result_type>>(allocator);
-			state->set_deffered_task(std::bind(std::forward<function_type>(function), std::forward<arguments>(args)...));
-			return future;
-		}
-
 		struct thread_pool_scheduler {
-			template<class function_type>
-			void operator() (function_type&& function) {
-				::concurrencpp::spawn(std::forward<function_type>(function));
+
+			template<class T>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
+				auto& thread_pool = ::concurrencpp::details::thread_pool::default_instance();
+				thread_pool.enqueue_task(std::move(task));
 			}
 		};
 
 		struct thread_scheduler {
-			template<class function_type>
-			void operator() (function_type&& function) {
-				::std::thread execution_thread(std::forward<function_type>(function));
+			template<class T>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
+				::std::thread execution_thread([_task = std::move(task)]() mutable{
+					_task->execute();
+				});
+
 				execution_thread.detach();
+			}
+		};
+
+		struct deffered_schedueler {
+			template<class T>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
+				state->set_deffered_task(std::move(task));
 			}
 		};
 
@@ -1337,16 +1236,19 @@ namespace concurrencpp {
 			throw_if_empty();
 
 			using return_type = typename std::result_of_t<continuation_type(future<T>)>;
+
 			details::pool_allocator<details::future_associated_state<return_type>> allocator;
 			auto new_associated_state =
 				std::allocate_shared<details::future_associated_state<return_type>>(allocator);
 
-			m_state->set_continuation(
-				details::future_continuation<continuation_type, T, return_type>(
-					std::forward<continuation_type>(continuation),
-					m_state,
-					new_associated_state));
+			auto task = details::future_associated_state<return_type>::
+				make_future_callable(new_associated_state,
+					[state = m_state,
+					continuation = std::forward<continuation_type>(continuation)]{
+				return continuation(future<T>(state));
+			});
 
+			m_state->set_continuation(std::move(task));
 			return future<return_type>(new_associated_state);
 		}
 
@@ -1376,7 +1278,7 @@ namespace concurrencpp {
 
 	template<class result_type, class exception_type>
 	future<result_type> make_exceptional_future(exception_type exception) {
-		return make_exceptional_future(std::make_exception_ptr(std::move(exception)));
+		return make_exceptional_future<result_type>(std::make_exception_ptr(std::move(exception)));
 	}
 
 	template<class T>
@@ -1532,7 +1434,7 @@ namespace concurrencpp {
 		}
 
 		case launch::deferred: {
-			//	return details::deffered_async_impl<result>(std::forward<F>(f), std::forward<Args>(args)...);
+			return details::async_impl<result, details::deffered_schedueler>::do_async(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
 		}
 
 		case launch::async: {
@@ -1542,13 +1444,14 @@ namespace concurrencpp {
 		}
 
 		assert(false);
-		//return future<result>();
+		__assume(0);
 	}
 
 	template <class F, class... Args>
 	auto async(launch launch_policy, F&& f) {
 		using function_type = typename std::decay_t<F>;
 		using result = typename std::result_of_t<function_type()>;
+		using unwrapped_type = typename details::unwrapped_type<result>::type;
 
 		switch (launch_policy) {
 
@@ -1557,7 +1460,7 @@ namespace concurrencpp {
 		}
 
 		case launch::deferred: {
-			return details::deffered_async_impl<result>(std::forward<F>(f));
+			return details::async_impl<result, details::deffered_schedueler>::do_async(std::forward<F>(f));
 		}
 
 		case launch::async: {
@@ -1567,7 +1470,6 @@ namespace concurrencpp {
 		}
 
 		assert(false);
-		return future<result>();
 	}
 
 	template<class T>
@@ -1579,7 +1481,7 @@ namespace concurrencpp {
 	template<class T, class coroutine_handle>
 	void await_suspend(future<T>& future, coroutine_handle&& handle) {
 		auto& inner_future_state = details::get_inner_state(future);
-		inner_future_state->set_continuation(std::forward<coroutine_handle>(handle));
+		inner_future_state->set_continuation(details::make_callback(std::forward<coroutine_handle>(handle)));
 	}
 
 	template<class T>
