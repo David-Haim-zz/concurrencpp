@@ -267,11 +267,15 @@ namespace concurrencpp {
 				return false;
 			}
 
-			static void* allocate_imp(size_t unaligned_size) noexcept {
+			static void* allocate_imp(size_t unaligned_size) {
 				assert(unaligned_size != 0);
 
 				if (unaligned_size > 512) {
-					return std::malloc(unaligned_size);
+					auto block = std::malloc(unaligned_size);
+					if (block == nullptr) {
+						throw std::bad_alloc();
+					}
+					return block;
 				}
 
 				const auto index = find_bucket_index(unaligned_size);
@@ -286,7 +290,11 @@ namespace concurrencpp {
 					return block;
 				}
 
-				return std::malloc(align_size(unaligned_size));
+				block = std::malloc(align_size(unaligned_size));
+				if (block == nullptr) {
+					throw std::bad_alloc();
+				}
+				return block;
 			}
 
 			static void deallocate_impl(void* block, size_t unaligned_size) noexcept {
@@ -316,7 +324,7 @@ namespace concurrencpp {
 
 		public:
 
-			static void* allocate(size_t size) noexcept {
+			static void* allocate(size_t size) {
 				return allocate_imp(size);
 			}
 
@@ -351,13 +359,7 @@ namespace concurrencpp {
 					return nullptr;
 				}
 
-				void* const block = memory_pool::allocate(n * sizeof(T));
-
-				if (block == nullptr) {
-					throw std::bad_alloc();
-				}
-
-				return static_cast<T*>(block);
+				return static_cast<T*>(memory_pool::allocate(n * sizeof(T)));
 			}
 
 			void deallocate(T* const block, const size_t size) const noexcept {
@@ -1086,13 +1088,11 @@ namespace concurrencpp {
 				});
 
 				scheduler_type::schedule(std::move(bridge_task), future_state.get());
-
 				return future_state;
 			}
 		};
 
 		struct thread_pool_scheduler {
-
 			template<class T>
 			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
 				auto& thread_pool = ::concurrencpp::details::thread_pool::default_instance();
@@ -1183,7 +1183,7 @@ namespace concurrencpp {
 
 	public:
 
-		future(decltype(m_state) state) :
+		future(decltype(m_state) state) noexcept :
 			m_state(std::move(state)) {}
 
 		future() noexcept = default;
@@ -1398,7 +1398,8 @@ namespace concurrencpp {
 
 	template<class function>
 	void spawn(function&& func) {
-		details::thread_pool::default_instance().enqueue_task(std::forward<function>(func));
+		details::thread_pool::default_instance().
+			enqueue_task(std::forward<function>(func));
 	}
 
 	enum class launch {
@@ -1504,7 +1505,6 @@ namespace std {
 			};
 		};
 
-
 		template<class... Args>
 		struct coroutine_traits<void, Args...> {
 			struct promise_type {
@@ -1536,7 +1536,6 @@ namespace std {
 
 			};
 		};
-
 
 	}//experimental
 }//std
