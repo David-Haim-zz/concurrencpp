@@ -20,6 +20,9 @@
 	SOFTWARE.
 */
 
+#ifndef CONCURRENCPP_H
+#define CONCURRENCPP_H
+
 #include <vector>
 #include <queue>
 #include <array>
@@ -41,7 +44,7 @@ namespace concurrencpp {
 		class spinlock {
 			constexpr static size_t locked = 1;
 			constexpr static size_t unlocked = 0;
-			constexpr static size_t spinCount = 128;
+			constexpr static size_t spin_count = 128;
 
 		private:
 			std::atomic_size_t m_lock;
@@ -64,7 +67,7 @@ namespace concurrencpp {
 						return;
 					}
 
-					if (counter == spinCount) {
+					if (counter == spin_count) {
 						break;
 					}
 
@@ -85,7 +88,7 @@ namespace concurrencpp {
 						return;
 					}
 
-					if (counter == spinCount) {
+					if (counter == spin_count) {
 						break;
 					}
 
@@ -111,6 +114,47 @@ namespace concurrencpp {
 					&m_lock,
 					true,
 					std::memory_order_acquire) == unlocked;
+			}
+
+		};
+
+		class recursive_spinlock {
+
+		private:
+			std::atomic<std::thread::id> m_owner;
+			int32_t m_count;
+
+		public:
+
+			recursive_spinlock() noexcept : m_count(0) {}
+
+			void lock() noexcept {
+				const auto this_thread = std::this_thread::get_id();
+				std::thread::id no_id;
+				if (m_owner != this_thread) {
+
+					while (!m_owner.compare_exchange_weak(no_id,
+						this_thread,
+						std::memory_order_acquire,
+						std::memory_order_relaxed)) {
+
+						std::this_thread::yield();
+
+					}
+
+				}
+
+				m_count++;
+			}
+
+			void unlock() {
+				assert(m_owner == std::this_thread::get_id());
+				assert(m_count != 0);
+
+				--m_count;
+				if (m_count == 0) {
+					m_owner.store(std::thread::id(), std::memory_order_release);
+				}
 			}
 
 		};
@@ -146,6 +190,11 @@ namespace concurrencpp {
 				auto block = m_head;
 				m_head = m_head->next;
 				--m_block_count;
+
+				assert(m_block_count == 0 ? 
+					(m_head == nullptr) : 
+					(m_head != nullptr));
+
 				return block;
 			}
 
@@ -275,6 +324,7 @@ namespace concurrencpp {
 					if (block == nullptr) {
 						throw std::bad_alloc();
 					}
+					
 					return block;
 				}
 
@@ -294,6 +344,7 @@ namespace concurrencpp {
 				if (block == nullptr) {
 					throw std::bad_alloc();
 				}
+
 				return block;
 			}
 
@@ -640,9 +691,8 @@ namespace concurrencpp {
 
 		protected:
 			//members are ordered in the order of their importance.
-
-			//mutable spinlock m_lock;
-			mutable std::recursive_mutex m_lock;
+			mutable recursive_spinlock m_lock;
+			//mutable std::recursive_mutex m_lock;
 			std::unique_ptr<callback_base> m_then;
 			future_result_state m_state;
 			std::unique_ptr<callback_base> m_deffered;
@@ -755,7 +805,7 @@ namespace concurrencpp {
 				if (static_cast<bool>(m_then)) {
 					m_then->execute();
 					m_then.reset();
-				}
+				}	
 			}
 			
 			void set_deffered_task(std::unique_ptr<callback_base> task) {
@@ -1430,6 +1480,9 @@ namespace concurrencpp {
 		}
 
 		assert(false);
+		return decltype(details::async_impl<
+			result, details::thread_pool_scheduler>::do_async(
+				std::bind(std::forward<F>(f), std::forward<Args>(args)...))){};
 	}
 
 	template <class F, class... Args>
@@ -1454,6 +1507,9 @@ namespace concurrencpp {
 		}
 
 		assert(false);
+		return decltype(details::async_impl<
+			result,
+			details::thread_pool_scheduler>::do_async(std::forward<F>(f))){};
 	}
 
 	template<class T>
@@ -1539,3 +1595,5 @@ namespace std {
 
 	}//experimental
 }//std
+
+#endif
