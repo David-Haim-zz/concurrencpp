@@ -49,11 +49,16 @@ namespace concurrencpp {
 		private:
 			std::atomic_size_t m_lock;
 
-		public:
+			static void pause_cpu() noexcept {
+#if (COMPILER == MVCC)
+				_mm_pause();
+#elif (COMPILER == GCC || COMPILER == LLVM)
+				asm volatile("pause\n": : : "memory");		
+#endif
+			}
 
-			spinlock() noexcept : m_lock(unlocked) {}
-
-			void lock() noexcept {
+			template<class on_fail>
+			bool try_lock_once(on_fail&& on_fail_callable) {
 				size_t counter = 0ul;
 
 				//make the processor yield
@@ -64,7 +69,7 @@ namespace concurrencpp {
 						std::memory_order_acquire);
 
 					if (state == unlocked) {
-						return;
+						return true;
 					}
 
 					if (counter == spin_count) {
@@ -72,37 +77,26 @@ namespace concurrencpp {
 					}
 
 					++counter;
-					//TODO: make a cross platform way to call _mm_pause
+					on_fail_callable();
 				}
 
-				counter = 0ul;
+				return false;
+			}
 
-				//make the thread yield
-				while (true) {
-					const auto state = std::atomic_exchange_explicit(
-						&m_lock,
-						locked,
-						std::memory_order_acquire);
+		public:
 
-					if (state == unlocked) {
-						return;
-					}
+			spinlock() noexcept : m_lock(unlocked) {}
 
-					if (counter == spin_count) {
-						break;
-					}
-
-					++counter;
-					std::this_thread::yield();
+			void lock() {
+				if (try_lock_once([] { pause_cpu(); })) {
+					return;
 				}
 
-				//make the thread sleep for 1 millisecond
-				while (std::atomic_exchange_explicit(
-					&m_lock,
-					locked,
-					std::memory_order_acquire) == locked) {
-					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				if (try_lock_once([] { std::this_thread::yield(); })) {
+					return;
 				}
+
+				while (try_lock_once([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }) == false);
 			}
 
 			void unlock() noexcept {
@@ -132,22 +126,19 @@ namespace concurrencpp {
 				const auto this_thread = std::this_thread::get_id();
 				std::thread::id no_id;
 				if (m_owner != this_thread) {
-
-					while (!m_owner.compare_exchange_weak(no_id,
+					while (!m_owner.compare_exchange_weak(
+						no_id,
 						this_thread,
 						std::memory_order_acquire,
 						std::memory_order_relaxed)) {
-
 						std::this_thread::yield();
-
 					}
-
 				}
 
 				m_count++;
 			}
 
-			void unlock() {
+			void unlock() noexcept {
 				assert(m_owner == std::this_thread::get_id());
 				assert(m_count != 0);
 
@@ -198,7 +189,7 @@ namespace concurrencpp {
 				return block;
 			}
 
-			void deallocate(void* chunk) {
+			void deallocate(void* chunk) noexcept{
 				auto block = static_cast<memory_block*>(chunk);
 				block->next = m_head;
 				m_head = block;
@@ -292,7 +283,7 @@ namespace concurrencpp {
 				return s_local_pool;
 			}
 
-			static void* allocate_from_global_pool(const size_t bucket_index) {
+			static void* allocate_from_global_pool(const size_t bucket_index) noexcept {
 				auto& global_pool = get_global_pool();
 				assert(bucket_index < global_pool.size());
 				auto& bucket = global_pool[bucket_index];
@@ -301,7 +292,7 @@ namespace concurrencpp {
 				return bucket.first.allocate();
 			}
 
-			static bool deallocate_to_global_pool(void* block, size_t index) {
+			static bool deallocate_to_global_pool(void* block, size_t index) noexcept {
 				auto& global_pool = get_global_pool();
 				assert(index < global_pool.size());
 
@@ -443,7 +434,7 @@ namespace concurrencpp {
 			callback(function_type&& function) :
 				m_function(std::forward<function_type>(function)) {}
 
-			virtual void execute() override final {	
+			virtual void execute() override final {
 				m_function();
 			}
 
@@ -531,10 +522,6 @@ namespace concurrencpp {
 
 					{
 						std::lock_guard<decltype(m_lock)> lock(m_lock);
-						/*if (!m_tasks.empty()) {
-							task = std::move(m_tasks.front());
-							m_tasks.pop();
-						}*/
 						task = m_tasks.try_pop();
 					}
 
@@ -563,7 +550,7 @@ namespace concurrencpp {
 				}
 			}
 
-			std::unique_ptr<callback_base> try_steal() {
+			std::unique_ptr<callback_base> try_steal() noexcept{
 				std::unique_lock<decltype(m_lock)> lock(m_lock, std::try_to_lock);
 
 				if (lock.owns_lock() && !m_tasks.empty()) {
@@ -623,6 +610,16 @@ namespace concurrencpp {
 			std::vector<worker_thread> m_workers;
 			std::atomic_bool m_stop;
 			std::mutex m_pool_lock;
+
+			static size_t number_of_threads_cpu() {
+				const auto concurrency_level = std::thread::hardware_concurrency();
+				return concurrency_level == 0 ? 8 : static_cast<size_t>(concurrency_level*1.25f);
+			}
+
+			static size_t number_of_threads_io() {
+				const auto concurrency_level = std::thread::hardware_concurrency();
+				return concurrency_level == 0 ? 8 : (concurrency_level * 2);
+			}
 
 		public:
 
@@ -696,15 +693,13 @@ namespace concurrencpp {
 			}
 
 			static thread_pool& default_instance() {
-				static thread_pool default_thread_pool(
-					static_cast<size_t>(std::thread::hardware_concurrency() * 1.25));
-				return default_thread_pool;
+				static thread_pool s_default_thread_pool(number_of_threads_cpu());
+				return s_default_thread_pool;
 			}
 
 			static thread_pool& blocking_tasks_instance() {
-				static thread_pool blocking_tasks_thread_pool(
-					static_cast<size_t>(std::thread::hardware_concurrency() * 2));
-				return blocking_tasks_thread_pool;
+				static thread_pool s_blocking_tasks_thread_pool(number_of_threads_io());
+				return s_blocking_tasks_thread_pool;
 			}
 
 		};
@@ -752,6 +747,7 @@ namespace concurrencpp {
 				}
 				catch (...) {
 					allocator.deallocate(cv, 1);
+					throw;
 				}
 
 				m_condition.reset(cv);
@@ -803,9 +799,9 @@ namespace concurrencpp {
 
 			void wait() {
 				/*
-				According to the standard, only non-timed wait on the future
-				will cause the deffered-function to be launched. this is why
-				this segment is not in wait_for implementation.
+					According to the standard, only non-timed wait on the future
+					will cause the deffered-function to be launched. this is why
+					this segment is not in wait_for implementation.
 				*/
 				if (m_deffered) {
 					m_deffered->execute();
@@ -853,21 +849,21 @@ namespace concurrencpp {
 				if (static_cast<bool>(then)) {
 					new_then = make_callback([
 						then = std::move(then),
-						callback = std::forward<function_type>(callback)]() mutable{
+							callback = std::forward<function_type>(callback)]() mutable{
 							callback();
 							then->execute();
 						});
 				}
 				else {
-					new_then = make_callback([				
+					new_then = make_callback([
 						callback = std::forward<function_type>(callback)]() mutable{
-						callback();
-					});
+							callback();
+						});
 				}
 
 				assert(static_cast<bool>(new_then));
 				assert(!static_cast<bool>(m_then));
-				m_then = std::move(new_then);		
+				m_then = std::move(new_then);
 			}
 
 			bool is_ready() const noexcept {
@@ -889,8 +885,8 @@ namespace concurrencpp {
 
 			void set_deffered_task(std::unique_ptr<callback_base> task) {
 				/*
-				this function should only be called once,
-				by using async + launch::deffered
+					this function should only be called once,
+					by using async + launch::deffered
 				*/
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 
@@ -1636,7 +1632,7 @@ namespace concurrencpp {
 }
 
 namespace concurrencpp {
-	
+
 	namespace details {
 
 		class when_all_state {
@@ -1646,7 +1642,7 @@ namespace concurrencpp {
 			std::atomic_size_t m_counter;
 
 		public:
-			when_all_state(size_t counter) noexcept : m_counter(counter){}
+			when_all_state(size_t counter) noexcept : m_counter(counter) {}
 
 			void on_task_finished() {
 				auto new_count = m_counter.fetch_sub(1, std::memory_order_acq_rel);
@@ -1687,7 +1683,7 @@ namespace concurrencpp {
 		struct when_any_state {
 			::std::atomic_bool fulfilled;
 			::concurrencpp::promise<size_t> promise;
-		
+
 			when_any_state() noexcept : fulfilled(false) {}
 
 			void on_task_finished(size_t index) {
@@ -1707,10 +1703,10 @@ namespace concurrencpp {
 		template<class type, class ... types>
 		void when_any_once(
 			std::shared_ptr<when_any_state> state,
-			size_t task_index, 
+			size_t task_index,
 			::concurrencpp::future<type>& future,
 			types&& ... future_types) {
-			
+
 			if (!future.valid()) {
 				throw std::future_error(std::future_errc::no_state);
 			}
