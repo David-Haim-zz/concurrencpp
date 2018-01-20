@@ -131,6 +131,7 @@ namespace concurrencpp {
 						this_thread,
 						std::memory_order_acquire,
 						std::memory_order_relaxed)) {
+						no_id = {};
 						std::this_thread::yield();
 					}
 				}
@@ -461,6 +462,9 @@ namespace concurrencpp {
 			callback_base* m_tail;
 
 		public:
+
+			work_queue() noexcept:
+				m_tail(nullptr){}
 
 			void push(decltype(m_head) task) noexcept {
 				if (m_head == nullptr) {
