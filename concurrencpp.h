@@ -617,12 +617,34 @@ namespace concurrencpp {
 
 			static size_t number_of_threads_cpu() {
 				const auto concurrency_level = std::thread::hardware_concurrency();
-				return concurrency_level == 0 ? 8 : static_cast<size_t>(concurrency_level*1.25f);
+				return concurrency_level == 0 ? 8 : static_cast<size_t>(concurrency_level * 1.25f);
 			}
 
 			static size_t number_of_threads_io() {
 				const auto concurrency_level = std::thread::hardware_concurrency();
 				return concurrency_level == 0 ? 8 : (concurrency_level * 2);
+			}
+
+			size_t choose_next_worker() noexcept {
+				static thread_local size_t counter = 0;
+				return ++counter % m_workers.size();
+			}
+
+			worker_thread* get_self_worker_impl() noexcept {
+				const auto this_thread_id = std::this_thread::get_id();
+				for (auto& worker : m_workers) {
+					if (worker.get_id() == this_thread_id) {
+						return &worker;
+					}
+				}
+
+				return nullptr;
+			}
+
+			worker_thread* get_self_worker() noexcept {
+				static thread_local auto cached_worker_thread =
+					get_self_worker_impl();
+				return cached_worker_thread;
 			}
 
 		public:
@@ -648,28 +670,6 @@ namespace concurrencpp {
 				for (auto& worker : m_workers) {
 					worker.join();
 				}
-			}
-
-			worker_thread* get_self_worker_impl() noexcept {
-				const auto this_thread_id = std::this_thread::get_id();
-				for (auto& worker : m_workers) {
-					if (worker.get_id() == this_thread_id) {
-						return &worker;
-					}
-				}
-
-				return nullptr;
-			}
-
-			worker_thread* get_self_worker() noexcept {
-				static thread_local auto cached_worker_thread =
-					get_self_worker_impl();
-				return cached_worker_thread;
-			}
-
-			size_t choose_next_worker() noexcept {
-				static thread_local size_t counter = 0;
-				return ++counter % m_workers.size();
 			}
 
 			template<class function_type, class ... arguments>
