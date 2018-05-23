@@ -116,7 +116,7 @@ namespace concurrencpp {
 
 		private:
 			std::atomic<std::thread::id> m_owner;
-			int32_t m_count;
+			intmax_t m_count;
 
 		public:
 
@@ -141,7 +141,7 @@ namespace concurrencpp {
 
 			void unlock() noexcept {
 				assert(m_owner == std::this_thread::get_id());
-				assert(m_count != 0);
+				assert(m_count > 0);
 
 				--m_count;
 				if (m_count == 0) {
@@ -164,14 +164,18 @@ namespace concurrencpp {
 		public:
 
 			block_list() noexcept : m_head(nullptr), m_block_count(0ul) {}
+			~block_list() noexcept { clear(); }
 
-			~block_list() noexcept {
+			void clear() noexcept {
 				auto cursor = m_head;
 				while (cursor != nullptr) {
 					auto temp = cursor;
 					cursor = cursor->next;
 					std::free(temp);
 				}
+
+				m_head = nullptr;
+				m_block_count = 0;
 			}
 
 			void* allocate() noexcept {
@@ -204,15 +208,36 @@ namespace concurrencpp {
 		};
 
 		class memory_pool {
-
-		private:
+			static constexpr size_t MAX_BLOCK_COUNT = 1024 * 64;
+			static constexpr size_t DEFAULT_POOL_SIZE = 4;
+			static constexpr size_t MEMORY_BLOCK_COUNT = 8;
 
 			using synchronized_list_type = std::pair<block_list, spinlock>;
-			using local_pool_type = std::array<block_list, 8>;
-			using global_pool_type = std::array<synchronized_list_type, 8>;
+			using pool_type = std::array<synchronized_list_type, MEMORY_BLOCK_COUNT>;
 			//pool = [32, 64 , 96, 128, 192, 256, 384, 512]
 
-			static constexpr size_t MAX_BLOCK_COUNT = 1024 * 64;
+		private:
+			std::vector<pool_type> m_pools;
+
+			static size_t calculate_pool_size() noexcept {
+				auto number_of_cpus = std::thread::hardware_concurrency();
+				if (number_of_cpus == 0) {
+					number_of_cpus = DEFAULT_POOL_SIZE;
+				}
+
+				return number_of_cpus;
+			}
+			
+			memory_pool(): m_pools(calculate_pool_size()){}
+
+			~memory_pool() {
+				for (auto& pool : m_pools) {
+					for (auto& bucket : pool) {
+						std::lock_guard<decltype(bucket.second)> lock(bucket.second);
+						bucket.first.clear();
+					}
+				}
+			}
 
 			static size_t align_size(const size_t unaligned_size) noexcept {
 				if (unaligned_size <= 32) {
@@ -274,105 +299,101 @@ namespace concurrencpp {
 				return static_cast<size_t>(-1);
 			}
 
-			static global_pool_type& get_global_pool() noexcept {
-				static global_pool_type s_global_pool;
-				return s_global_pool;
+			static memory_pool& instance() {
+				static memory_pool s_memory_pool;
+				return s_memory_pool;
 			}
 
-			static local_pool_type& get_local_pool() noexcept {
-				static thread_local local_pool_type s_local_pool;
-				return s_local_pool;
-			}
+			static size_t get_pool_index(size_t number_of_pools) {
+				static thread_local const size_t index = [] {
+					auto this_thread_id = std::this_thread::get_id();
+					std::hash<decltype(this_thread_id)> hasher;
+					return hasher(this_thread_id) % instance().m_pools.size();
+				}();
 
-			static void* allocate_from_global_pool(const size_t bucket_index) noexcept {
-				auto& global_pool = get_global_pool();
-				assert(bucket_index < global_pool.size());
-				auto& bucket = global_pool[bucket_index];
-
-				std::lock_guard<decltype(bucket.second)> lock(bucket.second);
-				return bucket.first.allocate();
-			}
-
-			static bool deallocate_to_global_pool(void* block, size_t index) noexcept {
-				auto& global_pool = get_global_pool();
-				assert(index < global_pool.size());
-
-				auto& synchonized_bucket = global_pool[index];
-				std::lock_guard<decltype(synchonized_bucket.second)> lock(synchonized_bucket.second);
-				const auto count = synchonized_bucket.first.get_block_count();
-				if (count < MAX_BLOCK_COUNT) {
-					synchonized_bucket.first.deallocate(block);
-					return true;
-				}
-
-				return false;
-			}
-
-			static void* allocate_imp(size_t unaligned_size) {
-				assert(unaligned_size != 0);
-
-				if (unaligned_size > 512) {
-					auto block = std::malloc(unaligned_size);
-					if (block == nullptr) {
-						throw std::bad_alloc();
-					}
-
-					return block;
-				}
-
-				const auto index = find_bucket_index(unaligned_size);
-				auto& local_pool = get_local_pool();
-				auto block = local_pool[index].allocate();
-				if (block != nullptr) {
-					return block;
-				}
-
-				block = allocate_from_global_pool(index);
-				if (block != nullptr) {
-					return block;
-				}
-
-				block = std::malloc(align_size(unaligned_size));
-				if (block == nullptr) {
-					throw std::bad_alloc();
-				}
-
-				return block;
-			}
-
-			static void deallocate_impl(void* block, size_t unaligned_size) noexcept {
-				if (unaligned_size == 0) {
-					return;
-				}
-
-				if (unaligned_size > 512) {
-					std::free(block);
-					return;
-				}
-
-				const auto index = find_bucket_index(unaligned_size);
-				auto& local_pool = get_local_pool();
-				assert(index < local_pool.size());
-
-				const auto count = local_pool[index].get_block_count();
-				if (count < MAX_BLOCK_COUNT) {
-					local_pool[index].deallocate(block);
-					return;
-				}
-
-				if (!deallocate_to_global_pool(block, index)) {
-					std::free(block);
-				}
+				return index;
 			}
 
 		public:
 
-			static void* allocate(size_t size) {
-				return allocate_imp(size);
+			static void* allocate(size_t chunk_size) {
+				assert(chunk_size != 0);
+
+				void* memory = nullptr;
+				if (chunk_size > 512) {
+					memory = std::malloc(chunk_size);
+					if (memory != nullptr) {
+						return memory;
+					}
+
+					throw std::bad_alloc();
+				}
+
+				auto& _this = instance();
+				auto& pools = _this.m_pools;
+				auto& pool = pools[get_pool_index(pools.size())];
+
+				const auto bucket_index = find_bucket_index(chunk_size);
+				assert(bucket_index < pool.size());
+				auto& bucket = pool[bucket_index];
+
+				{
+					std::lock_guard<decltype(bucket.second)> lock(bucket.second);
+					memory = bucket.first.allocate();
+				}
+
+				if (memory != nullptr) {
+					return memory;
+				}
+
+				//try stealing
+				const auto total = pools.size();
+				for (size_t i = 0; i < total; i++) {
+					auto& bucket = pools[i % total][bucket_index];
+					std::lock_guard<decltype(bucket.second)> lock(bucket.second);
+					memory = bucket.first.allocate();
+
+					if (memory != nullptr) {
+						return memory;
+					}
+				}
+
+				chunk_size = align_size(chunk_size);
+				memory = std::malloc(chunk_size);
+				if (memory != nullptr) {
+					return memory;
+				}
+
+				throw std::bad_alloc();
 			}
 
 			static void deallocate(void* chunk, size_t size) noexcept {
-				deallocate_impl(chunk, size);
+				assert(size != 0);
+
+				if (size > 512) {
+					std::free(chunk);
+					return;
+				}
+
+				auto& _this = instance();
+				auto& pools = _this.m_pools;
+
+				auto this_thread_id = std::this_thread::get_id();
+				std::hash<decltype(this_thread_id)> hasher;
+				auto pool_index = hasher(this_thread_id) % pools.size();
+				auto& pool = pools[pool_index];
+
+				const auto bucket_index = find_bucket_index(size);
+				auto& bucket = pool[bucket_index];
+
+				std::lock_guard<decltype(bucket.second)> lock(bucket.second);
+				const auto count = bucket.first.get_block_count();
+				if (count < MAX_BLOCK_COUNT) {
+					bucket.first.deallocate(chunk);
+				}
+				else {
+					std::free(chunk);
+				}
 			}
 
 		};
@@ -410,6 +431,17 @@ namespace concurrencpp {
 			}
 
 		};
+
+		struct pool_allocated {
+			static void* operator new(const size_t size) {
+				return memory_pool::allocate(size);
+			}
+
+			static void operator delete(void* block, size_t size) {
+				memory_pool::deallocate(block, size);
+			}
+
+		};
 	}
 
 	template<class T> class future;
@@ -425,7 +457,7 @@ namespace concurrencpp {
 		};
 
 		template<class function_type>
-		struct callback : public callback_base {
+		struct callback : public callback_base, public pool_allocated {
 
 		private:
 			function_type m_function;
@@ -439,20 +471,12 @@ namespace concurrencpp {
 				m_function();
 			}
 
-			static void* operator new(const size_t size) {
-				return memory_pool::allocate(size);
-			}
-
-			static void operator delete(void* block) {
-				memory_pool::deallocate(block, sizeof(callback<function_type>));
-			}
-
 		};
 
-		template<class f>
-		std::unique_ptr<callback_base> make_callback(f&& function) {
+		template<class function_type>
+		std::unique_ptr<callback_base> make_callback(function_type&& function) {
 			return std::unique_ptr<callback_base>(
-				new callback<f>(std::forward<f>(function)));
+				new callback<function_type>(std::forward<function_type>(function)));
 		}
 
 		class work_queue {
@@ -463,8 +487,7 @@ namespace concurrencpp {
 
 		public:
 
-			work_queue() noexcept:
-				m_tail(nullptr){}
+			work_queue() noexcept : m_tail(nullptr){}
 
 			void push(decltype(m_head) task) noexcept {
 				if (m_head == nullptr) {
@@ -1175,7 +1198,7 @@ namespace concurrencpp {
 		}
 
 		template<class function_type>
-		class async_state : public callback_base {
+		class async_state : public callback_base, public pool_allocated {
 
 			using return_type = typename std::result_of_t<function_type()>;
 			using is_void_type = typename std::conditional_t<
@@ -2188,7 +2211,6 @@ namespace concurrencpp {
 
 	};
 
-
 }
 
 namespace std {
@@ -2197,7 +2219,7 @@ namespace std {
 		template<class type, class... arguments>
 		struct coroutine_traits<::concurrencpp::future<type>, arguments...> {
 			
-			struct promise_type {
+			struct promise_type : public concurrencpp::details::pool_allocated {
 			private:
 				::concurrencpp::promise<type> m_promise;
 
@@ -2228,20 +2250,13 @@ namespace std {
 					m_promise.set_value(std::forward<return_type>(value));
 				}
 
-				void* operator new (const size_t size) {
-					return ::concurrencpp::details::memory_pool::allocate(size);
-				}
-
-				void operator delete(void* const pointer, const size_t size) {
-					::concurrencpp::details::memory_pool::deallocate(pointer, size);
-				}
 			};
 		};
 
 		template<class... arguments>
 		struct coroutine_traits<::concurrencpp::future<void>, arguments...> {
 
-			struct promise_type {
+			struct promise_type : public concurrencpp::details::pool_allocated {
 			
 			private:
 				::concurrencpp::promise<void> m_promise;
@@ -2272,20 +2287,14 @@ namespace std {
 					m_promise.set_value();
 				}
 
-				void* operator new (const size_t size) {
-					return ::concurrencpp::details::memory_pool::allocate(size);
-				}
-
-				void operator delete(void* const pointer, const size_t size) {
-					::concurrencpp::details::memory_pool::deallocate(pointer, size);
-				}
 			};
 		};
 
 
 		template<class... Args>
 		struct coroutine_traits<void, Args...> {
-			struct promise_type {
+
+			struct promise_type : public concurrencpp::details::pool_allocated {
 
 				promise_type() noexcept {}
 
@@ -2303,14 +2312,6 @@ namespace std {
 
 				template<class exception_type>
 				void set_exception(exception_type&& exception) noexcept {}
-
-				void* operator new (const size_t size) {
-					return ::concurrencpp::details::memory_pool::allocate(size);
-				}
-
-				void operator delete(void* const pointer, const size_t size) {
-					::concurrencpp::details::memory_pool::deallocate(pointer, size);
-				}
 
 			};
 		};
