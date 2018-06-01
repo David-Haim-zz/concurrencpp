@@ -463,13 +463,9 @@ namespace concurrencpp {
 			function_type m_function;
 
 		public:
+			callback(function_type&& function) : m_function(std::forward<function_type>(function)) {}
 
-			callback(function_type&& function) :
-				m_function(std::forward<function_type>(function)) {}
-
-			virtual void execute() override final {
-				m_function();
-			}
+			virtual void execute() override final { m_function(); }
 
 		};
 
@@ -1113,7 +1109,7 @@ namespace concurrencpp {
 		};
 
 		template<class original_type, class callback_type>
-		class future_then : public callback_base {
+		class future_then : public callback_base, public pool_allocated {
 
 			using new_type = typename std::result_of_t<callback_type(::concurrencpp::future<original_type>)>;
 			using future_type = ::concurrencpp::future<original_type>;
@@ -1174,6 +1170,25 @@ namespace concurrencpp {
 
 			return new_future;
 		}
+
+		template<class type>
+		class future_awaiter {
+		
+		private:
+			future_associated_state<type>& m_state;
+
+		public:
+			future_awaiter(decltype(m_state) state) noexcept : m_state(state) {}
+
+			bool await_ready() noexcept { return m_state.is_ready(); }
+
+			template<class coroutine_handle>
+			void await_suspend(coroutine_handle&& handle) {
+				m_state.set_continuation(make_callback(std::forward<coroutine_handle>(handle)));
+			}
+
+			type await_resume() { return m_state.get(); }
+		};
 
 		class promise_base {
 
@@ -1258,7 +1273,7 @@ namespace concurrencpp {
 		struct thread_scheduler {
 			template<class T>
 			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
-				::std::thread execution_thread([_task = std::move(task)]() mutable{
+				::std::thread execution_thread([_task = std::move(task)]() mutable {
 					_task->execute();
 				});
 
@@ -1596,15 +1611,15 @@ namespace concurrencpp {
 
 	}
 
-	template<class T>
+	template<class type>
 	class future {
 
-		template<class T> friend class ::concurrencpp::details::future_associated_state;
-		template<class T> friend class ::concurrencpp::promise;
-		template<class T> friend auto& details::get_inner_state(T& state_holder) noexcept;
+		template<class type> friend class ::concurrencpp::details::future_associated_state;
+		template<class type> friend class ::concurrencpp::promise;
+		template<class type> friend auto& details::get_inner_state(type& state_holder) noexcept;
 
 	private:
-		std::shared_ptr<details::future_associated_state<T>> m_state;
+		std::shared_ptr<details::future_associated_state<type>> m_state;
 
 		void throw_if_empty() const {
 			if (!static_cast<bool>(m_state)) {
@@ -1614,8 +1629,7 @@ namespace concurrencpp {
 
 	public:
 
-		future(decltype(m_state) state) noexcept :
-			m_state(std::move(state)) {}
+		future(decltype(m_state) state) noexcept : m_state(std::move(state)) {}
 
 		future() noexcept = default;
 		future(future&& rhs) noexcept = default;
@@ -1642,7 +1656,7 @@ namespace concurrencpp {
 			return wait_for(diff);
 		}
 
-		T get() {
+		type get() {
 			throw_if_empty();
 			future _this(std::move(*this));
 			return _this.m_state->get();
@@ -1651,49 +1665,41 @@ namespace concurrencpp {
 		template<class continuation_type>
 		auto then(continuation_type&& continuation) {
 			throw_if_empty();
-			return make_future_then(
-				m_state,
-				std::forward<continuation_type>(continuation));
+			return make_future_then(m_state, std::forward<continuation_type>(continuation));
+		}
+
+		auto operator co_await() {
+			throw_if_empty();
+			return details::future_awaiter<type>(*m_state);
 		}
 
 	};
 
-	template<class result_type>
-	future<result_type> make_ready_future(result_type&& result) {
-		future<result_type> ready_future;
-		details::pool_allocator<details::future_associated_state<result_type>> allocator;
-		auto& future_inner_state = details::get_inner_state(ready_future);
-		future_inner_state =
-			std::allocate_shared<details::future_associated_state<result_type>>(allocator);
-		future_inner_state->set_result(std::forward<result_type>(result));
-		return ready_future;
+	template<class result_type, class ... argument_types>
+	future<result_type> make_ready_future(argument_types&& ... args) {
+		promise<result_type> promise;
+		promise.set_value(std::forward<argument_types>(args)...);
+		return promise.get_future();
 	}
 
 	template<class type = void>
 	future<void> make_ready_future() {
-		future<void> ready_future;
-		details::pool_allocator<details::future_associated_state<void>> allocator;
-		auto& future_inner_state = details::get_inner_state(ready_future);
-		future_inner_state =
-			std::allocate_shared<details::future_associated_state<void>>(allocator);
-		future_inner_state->set_result();
-		return ready_future;
+		promise<void> promise;
+		promise.set_value();
+		return promise.get_future();
+	}
+	
+	template<class result_type, class exception_type, class ... argument_types>
+	future<result_type> make_exceptional_future(argument_types&& ... args) {
+		return make_exceptional_future<result_type>(
+			std::make_exception_ptr(exception_type(std::forward<argument_types>(args)...)));
 	}
 
 	template<class result_type>
 	future<result_type> make_exceptional_future(std::exception_ptr exception_pointer) {
-		future<result_type> ready_future;
-		details::pool_allocator<details::future_associated_state<result_type>> allocator;
-		auto& future_inner_state = details::get_inner_state(ready_future);
-		future_inner_state =
-			std::allocate_shared<details::future_associated_state<result_type>>(allocator);
-		future_inner_state->set_exception(exception_pointer);
-		return ready_future;
-	}
-
-	template<class result_type, class exception_type>
-	future<result_type> make_exceptional_future(exception_type exception) {
-		return make_exceptional_future<result_type>(std::make_exception_ptr(std::move(exception)));
+		promise<result_type> promise;
+		promise.set_exception(exception_pointer);
+		return promise.get_future();
 	}
 
 	template<class T>
@@ -1796,8 +1802,7 @@ namespace concurrencpp {
 
 		void create_state() {
 			details::pool_allocator<details::future_associated_state<void>> allocator;
-			m_state =
-				std::allocate_shared<details::future_associated_state<void>>(allocator);
+			m_state = std::allocate_shared<details::future_associated_state<void>>(allocator);
 		}
 
 		void ensure_state() {
@@ -1957,24 +1962,6 @@ namespace concurrencpp {
 	template <class function_type>
 	auto async(function_type&& function) {
 		return async(launch::task, std::forward<function_type>(function));
-	}
-
-	template<class T>
-	bool await_ready(const future<T>& future) noexcept {
-		auto& inner_future_state = details::get_inner_state(future);
-		return inner_future_state->is_ready();
-	}
-
-	template<class T, class coroutine_handle>
-	void await_suspend(future<T>& future, coroutine_handle&& handle) {
-		auto& inner_future_state = details::get_inner_state(future);
-		inner_future_state->set_continuation(details::make_callback(std::forward<coroutine_handle>(handle)));
-	}
-
-	template<class T>
-	T await_resume(future<T>& future) {
-		auto& inner_future_state = details::get_inner_state(future);
-		return inner_future_state->result_or_exception_unlocked();
 	}
 }
 
@@ -2166,8 +2153,7 @@ namespace concurrencpp {
 		struct empty_timer : public std::runtime_error {
 
 			template<class ... arguments>
-			empty_timer(arguments&& ... args) :
-				std::runtime_error(std::forward<arguments>(args)...) {}
+			empty_timer(arguments&& ... args) : std::runtime_error(std::forward<arguments>(args)...) {}
 
 		};
 
@@ -2291,8 +2277,8 @@ namespace std {
 		};
 
 
-		template<class... Args>
-		struct coroutine_traits<void, Args...> {
+		template<class... arguments>
+		struct coroutine_traits<void, arguments...> {
 
 			struct promise_type : public concurrencpp::details::pool_allocated {
 
