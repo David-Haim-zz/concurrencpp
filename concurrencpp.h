@@ -1288,6 +1288,32 @@ namespace concurrencpp {
 			}
 		};
 
+		template<class type>
+		class promise_type_base {
+	
+		protected:
+			::concurrencpp::promise<type> m_promise;
+
+		public:
+			
+			bool initial_suspend() const noexcept { return false; }
+			bool final_suspend() const noexcept { return false; }
+
+			::concurrencpp::future<type> get_return_object() {
+				return m_promise.get_future();
+			}
+
+			void set_exception(std::exception_ptr exception) {
+				m_promise.set_exception(exception);
+			}
+
+			template<class exception_type>
+			void set_exception(exception_type&& exception) {
+				m_promise.set_exception(std::forward<exception_type>(exception));
+			}
+
+		};
+
 		class timer_impl {
 
 		protected:
@@ -1309,8 +1335,7 @@ namespace concurrencpp {
 
 		public:
 
-			inline timer_impl(const size_t due_time,
-				const size_t frequency, const bool is_oneshot) noexcept :
+			inline timer_impl(const size_t due_time, const size_t frequency, const bool is_oneshot) noexcept :
 				m_due_time(due_time),
 				m_next_fire_time(due_time),
 				m_frequency(frequency),
@@ -1360,6 +1385,10 @@ namespace concurrencpp {
 				m_is_canceled.store(true, std::memory_order_release);
 			}
 
+			inline bool cancelled() noexcept {
+				return m_is_canceled.load(std::memory_order_acquire);
+			}
+
 			inline const size_t next_fire_time() const noexcept {
 				return m_next_fire_time;
 			}
@@ -1373,7 +1402,7 @@ namespace concurrencpp {
 		};
 
 		template<class task_type>
-		class concrete_timer : public timer_impl {
+		class concrete_timer final : public timer_impl {
 
 		private:
 			task_type m_task;
@@ -1381,10 +1410,7 @@ namespace concurrencpp {
 		public:
 
 			template<class function_type>
-			concrete_timer(const size_t due_time,
-				const size_t frequency,
-				const bool is_oneshot,
-				function_type&& function) :
+			concrete_timer(const size_t due_time, const size_t frequency, const bool is_oneshot, function_type&& function) :
 				timer_impl(due_time, frequency, is_oneshot),
 				m_task(std::forward<function_type>(function)) {}
 
@@ -1634,6 +1660,9 @@ namespace concurrencpp {
 		future() noexcept = default;
 		future(future&& rhs) noexcept = default;
 		future& operator = (future&& rhds) noexcept = default;
+
+		future(const future& rhs) = delete;
+		future& operator = (const future&) = delete;
 
 		bool valid() const noexcept {
 			return static_cast<bool>(m_state);
@@ -2082,10 +2111,12 @@ namespace concurrencpp {
 	private:
 		std::shared_ptr<details::timer_impl> m_impl;
 
-		void valide_state() const {
-			if (!static_cast<bool>(m_impl)) {
-				throw empty_timer("concurrencpp::timer - timer is empty.");
+		void throw_if_empty() const {
+			if (static_cast<bool>(m_impl)) {
+				return;
 			}
+
+			throw empty_timer("concurrencpp::timer - timer is empty.");
 		}
 
 		template<class function_type, class ... arguments_type>
@@ -2101,11 +2132,10 @@ namespace concurrencpp {
 				details::timer_queue_container::default_instance();
 
 			/*
-			if for some reason we fail to build a threadpool
-			let the exception be thrown synchronously on the caller thread.
+				if for some reason we fail to build a threadpool
+				let the exception be thrown synchronously on the caller thread.
 			*/
-			auto& thread_pool =
-				details::thread_pool::default_instance();
+			auto& thread_pool = details::thread_pool::default_instance();
 
 			timer_ptr = details::make_timer_impl(
 				due_time,
@@ -2136,17 +2166,22 @@ namespace concurrencpp {
 		timer& operator = (const timer&) = delete;
 		timer& operator = (timer&&) noexcept = default;
 
-		void cancel() noexcept {
-			valide_state();
+		void cancel() {
+			throw_if_empty();
 			m_impl->cancel();
 		}
 
-		void set_frequency(size_t new_frequency) noexcept {
-			valide_state();
+		bool cancelled() const {
+			throw_if_empty();
+			return m_impl->cancelled();
+		}
+
+		void set_frequency(size_t new_frequency) {
+			throw_if_empty();
 			m_impl->set_new_frequency_time(new_frequency);
 		}
 
-		bool is_valid() const noexcept {
+		bool valid() const noexcept {
 			return static_cast<bool>(m_impl);
 		}
 
@@ -2170,7 +2205,7 @@ namespace concurrencpp {
 				std::forward<arguments_type>(args)...);
 		}
 
-		template<class T = void>
+		template<class ignored_type = void>
 		static future<void> delay(size_t due_time) {
 
 			struct delayer {
@@ -2179,9 +2214,7 @@ namespace concurrencpp {
 
 				delayer(size_t due_time) noexcept : due_time(due_time) {}
 
-				bool await_ready() const noexcept {
-					return false;
-				}
+				bool await_ready() const noexcept { return false; }
 
 				void await_suspend(std::experimental::coroutine_handle<void> coro_handle) const {
 					timer::once(due_time, coro_handle);
@@ -2205,31 +2238,9 @@ namespace std {
 		template<class type, class... arguments>
 		struct coroutine_traits<::concurrencpp::future<type>, arguments...> {
 			
-			struct promise_type : public concurrencpp::details::pool_allocated {
-			private:
-				::concurrencpp::promise<type> m_promise;
-
-			public:
-				::concurrencpp::future<type> get_return_object() {
-					return m_promise.get_future();
-				}
-
-				bool initial_suspend() const noexcept {
-					return (false);
-				}
-
-				bool final_suspend() const noexcept {
-					return (false);
-				}
-
-				void set_exception(std::exception_ptr exception) {
-					m_promise.set_exception(exception);
-				}
-
-				template<class exception_type>
-				void set_exception(exception_type&& exception) {
-					m_promise.set_exception(std::forward<exception_type>(exception));
-				}
+			struct promise_type : 
+				public concurrencpp::details::promise_type_base<type> ,
+				public concurrencpp::details::pool_allocated {
 
 				template<class return_type>
 				void return_value(return_type&& value) {
@@ -2242,58 +2253,24 @@ namespace std {
 		template<class... arguments>
 		struct coroutine_traits<::concurrencpp::future<void>, arguments...> {
 
-			struct promise_type : public concurrencpp::details::pool_allocated {
-			
-			private:
-				::concurrencpp::promise<void> m_promise;
-
-			public:
-				::concurrencpp::future<void> get_return_object() {
-					return m_promise.get_future();
-				}
-
-				bool initial_suspend() const noexcept {
-					return (false);
-				}
-
-				bool final_suspend() const noexcept {
-					return (false);
-				}
-
-				void set_exception(std::exception_ptr exception) {
-					m_promise.set_exception(exception);
-				}
-
-				template<class exception_type>
-				void set_exception(exception_type&& exception) {
-					m_promise.set_exception(std::forward<exception_type>(exception));
-				}
+			struct promise_type :
+				public concurrencpp::details::promise_type_base<void> ,
+				public concurrencpp::details::pool_allocated {
 
 				void return_void() {
 					m_promise.set_value();
 				}
-
 			};
 		};
 
-
-		template<class... arguments>
+		template<class ... arguments>
 		struct coroutine_traits<void, arguments...> {
 
 			struct promise_type : public concurrencpp::details::pool_allocated {
-
 				promise_type() noexcept {}
-
 				void get_return_object() noexcept {}
-
-				bool initial_suspend() const noexcept {
-					return (false);
-				}
-
-				bool final_suspend() const noexcept {
-					return (false);
-				}
-
+				bool initial_suspend() const noexcept { return false; }
+				bool final_suspend() const noexcept { return false; }
 				void return_void() noexcept {}
 
 				template<class exception_type>
