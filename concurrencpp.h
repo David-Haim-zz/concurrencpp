@@ -535,12 +535,7 @@ namespace concurrencpp {
 			void work(std::mutex& construction_lock) {
 				wait_for_pool_construction(construction_lock);
 
-				while (true) {
-
-					if (m_stop.load(std::memory_order_acquire)) {
-						return;
-					}
-
+				while (!m_stop.load(std::memory_order_acquire)) {
 					std::unique_ptr<callback_base> task;
 
 					{
@@ -573,7 +568,7 @@ namespace concurrencpp {
 				}
 			}
 
-			std::unique_ptr<callback_base> try_steal() noexcept{
+			std::unique_ptr<callback_base> try_steal() noexcept {
 				std::unique_lock<decltype(m_lock)> lock(m_lock, std::try_to_lock);
 
 				if (lock.owns_lock() && !m_tasks.empty()) {
@@ -730,12 +725,13 @@ namespace concurrencpp {
 		enum class future_result_state {
 			NOT_READY,
 			RESULT,
-			EXCEPTION
+			EXCEPTION,
+			DEFFERED
 		};
 
-		template<class T>
+		template<class type>
 		union compressed_future_result {
-			T result;
+			type result;
 			std::exception_ptr exception;
 
 			compressed_future_result() noexcept {};
@@ -743,19 +739,11 @@ namespace concurrencpp {
 
 		};
 
-		template<class T>
-		union compressed_future_result<T&> {
-			T* result;
+		template<class type>
+		union compressed_future_result<type&> {
+			type* result;
 			std::exception_ptr exception;
 
-			compressed_future_result() noexcept {};
-			~compressed_future_result() noexcept {};
-		};
-
-		template<>
-		union compressed_future_result<void> {
-			std::exception_ptr exception;
-		
 			compressed_future_result() noexcept {};
 			~compressed_future_result() noexcept {};
 		};
@@ -767,7 +755,6 @@ namespace concurrencpp {
 			mutable recursive_spinlock m_lock;
 			std::unique_ptr<callback_base> m_then;
 			future_result_state m_state;
-			std::unique_ptr<callback_base> m_deffered;
 			mutable std::unique_ptr<std::condition_variable_any> m_condition; //lazy creation
 
 			void build_condition_object() const {
@@ -786,8 +773,7 @@ namespace concurrencpp {
 
 		public:
 
-			future_associated_state_base() noexcept :
-				m_state(future_result_state::NOT_READY) {}
+			future_associated_state_base() noexcept : m_state(future_result_state::NOT_READY) {}
 
 			std::condition_variable_any& get_condition() {
 				if (!static_cast<bool>(m_condition)) {
@@ -811,7 +797,7 @@ namespace concurrencpp {
 			::std::future_status wait_for(std::chrono::duration<duration_unit, ratio> duration) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 
-				if (static_cast<bool>(m_deffered)) {
+				if (m_state == future_result_state::DEFFERED) {
 					return ::std::future_status::deferred;
 				}
 
@@ -834,11 +820,19 @@ namespace concurrencpp {
 					will cause the deffered-function to be launched. this is why
 					this segment is not in wait_for implementation.
 				*/
-				if (m_deffered) {
-					m_deffered->execute();
-					m_deffered.reset();
-					assert(m_state != future_result_state::NOT_READY);
-					return;
+
+				{
+					std::unique_lock<decltype(m_lock)> lock(m_lock);
+					if (m_state == future_result_state::DEFFERED) {
+						auto deffered_task = std::move(m_then);
+						m_then = std::move(deffered_task->next);
+						deffered_task->execute();
+						deffered_task.reset();
+						call_continuation();
+						assert(m_state != future_result_state::DEFFERED);
+						assert(m_state != future_result_state::NOT_READY);
+						return;
+					}
 				}
 
 				while (wait_for(std::chrono::hours(365 * 24)) == std::future_status::timeout);
@@ -847,6 +841,12 @@ namespace concurrencpp {
 			void set_continuation(std::unique_ptr<callback_base> continuation) {
 				{
 					std::unique_lock<decltype(m_lock)> lock(m_lock);
+
+					if (m_state == future_result_state::DEFFERED) {
+						assert(m_then->next.get() == nullptr);
+						m_then->next = std::move(continuation);
+						return;
+					}
 
 					if (m_state == future_result_state::NOT_READY) {
 						assert(!static_cast<bool>(m_then));
@@ -861,7 +861,7 @@ namespace concurrencpp {
 			}
 
 			bool has_deffered_task() const noexcept {
-				return static_cast<bool>(m_deffered);
+				return m_state == future_result_state::DEFFERED;
 			}
 
 			template<class function_type>
@@ -899,7 +899,8 @@ namespace concurrencpp {
 
 			bool is_ready() const noexcept {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				return m_state != future_result_state::NOT_READY;
+				return m_state == future_result_state::EXCEPTION ||
+					m_state == future_result_state::RESULT;
 			}
 
 			void call_continuation() {
@@ -914,7 +915,7 @@ namespace concurrencpp {
 				}
 			}
 
-			void set_deffered_task(std::unique_ptr<callback_base> task) {
+			void set_deffered_task(std::unique_ptr<callback_base> task) noexcept {
 				/*
 					this function should only be called once,
 					by using async + launch::deffered
@@ -922,9 +923,10 @@ namespace concurrencpp {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 
 				assert(m_state == future_result_state::NOT_READY);
-				assert(!static_cast<bool>(m_deffered));
+				assert(!static_cast<bool>(m_then));
 
-				m_deffered = std::move(task);
+				m_then = std::move(task);
+				m_state = future_result_state::DEFFERED;
 			}
 
 			bool has_continuation() const noexcept {
@@ -962,7 +964,7 @@ namespace concurrencpp {
 			template<class ... arguments>
 			void set_result(arguments&& ... args) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				new (std::addressof(m_result.result))
 					T(std::forward<arguments>(args)...);
 				m_state = future_result_state::RESULT;
@@ -976,7 +978,7 @@ namespace concurrencpp {
 
 			void set_exception(std::exception_ptr exception_pointer) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				new (std::addressof(m_result.exception))
 					std::exception_ptr(std::move(exception_pointer));
 				m_state = future_result_state::EXCEPTION;
@@ -1016,7 +1018,7 @@ namespace concurrencpp {
 
 			void set_exception(std::exception_ptr exception_pointer) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				m_exception = std::move(exception_pointer);
 				m_state = future_result_state::EXCEPTION;
 				call_continuation();
@@ -1024,7 +1026,7 @@ namespace concurrencpp {
 
 			void set_result() {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				m_state = future_result_state::RESULT;
 				call_continuation();
 			}
@@ -1066,7 +1068,7 @@ namespace concurrencpp {
 
 			void set_result(T& reference) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				m_result.result = std::addressof(reference);
 				m_state = future_result_state::RESULT;
 				call_continuation();
@@ -1079,7 +1081,7 @@ namespace concurrencpp {
 
 			void set_exception(std::exception_ptr exception_pointer) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				new (std::addressof(m_result.exception))
 					std::exception_ptr(std::move(exception_pointer));
 				m_state = future_result_state::EXCEPTION;
