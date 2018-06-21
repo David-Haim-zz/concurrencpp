@@ -934,12 +934,11 @@ namespace concurrencpp {
 			}
 		};
 
-		template<class T>
-		class future_associated_state :
-			public future_associated_state_base {
+		template<class type>
+		class future_associated_state : public future_associated_state_base {
 
 		private:
-			compressed_future_result<T> m_result;
+			compressed_future_result<type> m_result;
 
 		public:
 
@@ -949,7 +948,7 @@ namespace concurrencpp {
 				switch (m_state) {
 
 				case future_result_state::RESULT: {
-					m_result.result.~T();
+					m_result.result.~type();
 					return;
 				}
 
@@ -961,12 +960,11 @@ namespace concurrencpp {
 				}
 			}
 
-			template<class ... arguments>
-			void set_result(arguments&& ... args) {
+			template<class ... argument_types>
+			void set_result(argument_types&& ... args) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
-				new (std::addressof(m_result.result))
-					T(std::forward<arguments>(args)...);
+				new (std::addressof(m_result.result)) type(std::forward<argument_types>(args)...);
 				m_state = future_result_state::RESULT;
 				call_continuation();
 			}
@@ -985,12 +983,12 @@ namespace concurrencpp {
 				call_continuation();
 			}
 
-			T result_or_exception() {
+			type result_or_exception() {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 				return result_or_exception_unlocked();
 			}
 
-			T result_or_exception_unlocked() {
+			type result_or_exception_unlocked() {
 				assert(m_state != future_result_state::NOT_READY);
 
 				if (m_state == future_result_state::EXCEPTION) {
@@ -1000,7 +998,7 @@ namespace concurrencpp {
 				return std::move(m_result.result);
 			}
 
-			T get() {
+			type get() {
 				wait();
 				return result_or_exception_unlocked();
 			}
@@ -1008,8 +1006,7 @@ namespace concurrencpp {
 		};
 
 		template<>
-		class future_associated_state<void> :
-			public future_associated_state_base {
+		class future_associated_state<void> : public future_associated_state_base {
 
 		private:
 			std::exception_ptr m_exception;
@@ -1022,6 +1019,11 @@ namespace concurrencpp {
 				m_exception = std::move(exception_pointer);
 				m_state = future_result_state::EXCEPTION;
 				call_continuation();
+			}
+
+			template<class exception>
+			void set_exception(exception&& given_exception) {
+				set_exception(std::make_exception_ptr(std::forward<exception>(given_exception)));
 			}
 
 			void set_result() {
@@ -1051,8 +1053,7 @@ namespace concurrencpp {
 		};
 
 		template<class T>
-		class future_associated_state<T&> :
-			public future_associated_state_base {
+		class future_associated_state<T&> : public future_associated_state_base {
 
 			compressed_future_result<T&> m_result;
 
@@ -1192,21 +1193,75 @@ namespace concurrencpp {
 			type await_resume() { return m_state.get(); }
 		};
 
+		template<class type>
 		class promise_base {
 
 		protected:
+			std::shared_ptr<details::future_associated_state<type>> m_state;
 			bool m_future_retreived, m_fulfilled, m_moved;
 
 			promise_base() noexcept : m_fulfilled(false), m_future_retreived(false), m_moved(false) {}
 			promise_base(promise_base&& rhs) noexcept = default;
 			promise_base& operator = (promise_base&& rhs) noexcept = default;
 
-		public:
 
-			bool valid() const noexcept {
-				return !m_moved;
+			void create_state() {
+				details::pool_allocator<details::future_associated_state<type>> allocator;
+				m_state = std::allocate_shared<details::future_associated_state<type>>(allocator);
 			}
 
+			void ensure_state() {
+				if (m_moved) {
+					throw std::future_error(std::future_errc::no_state);
+				}
+
+				if (m_fulfilled) {
+					throw std::future_error(std::future_errc::promise_already_satisfied);
+				}
+
+				if (!m_state) {
+					create_state();
+				}
+			}
+
+			void break_promise_if_needed() {
+				if (static_cast<bool>(m_state) &&
+					!m_fulfilled &&
+					!m_state->has_deffered_task()) {
+					m_state->set_exception(std::future_error(std::future_errc::broken_promise));
+				}
+			}
+
+		public:
+
+			~promise_base() noexcept {
+				break_promise_if_needed();
+			}
+
+			::concurrencpp::future<type> get_future() {
+				if (m_moved) {
+					throw std::future_error(std::future_errc::no_state);
+				}
+
+				if (m_future_retreived) {
+					throw std::future_error(std::future_errc::future_already_retrieved);
+				}
+
+				if (!static_cast<bool>(m_state)) {
+					create_state();
+				}
+
+				m_future_retreived = true;
+				return future<type>(m_state);
+			}
+
+			void set_exception(std::exception_ptr exception_pointer) {
+				ensure_state();
+				m_state->set_exception(exception_pointer);
+				m_fulfilled = true;
+			}
+
+			bool valid() const noexcept { return !m_moved; }
 		};
 
 		template<class T>
@@ -1733,40 +1788,8 @@ namespace concurrencpp {
 		return promise.get_future();
 	}
 
-	template<class T>
-	class promise : public details::promise_base {
-
-	private:
-		std::shared_ptr<details::future_associated_state<T>> m_state;
-
-		void create_state() {
-			details::pool_allocator<details::future_associated_state<T>> allocator;
-			m_state = std::allocate_shared<details::future_associated_state<T>>(allocator);
-		}
-
-		void ensure_state() {
-			if (m_moved) {
-				throw std::future_error(std::future_errc::no_state);
-			}
-
-			if (m_fulfilled) {
-				throw std::future_error(std::future_errc::promise_already_satisfied);
-			}
-
-			if (!m_state) {
-				create_state();
-			}
-		}
-
-		void break_promise_if_needed() {
-			if (static_cast<bool>(m_state) &&
-				!m_fulfilled &&
-				!m_state->has_deffered_task()) {
-				m_state->set_exception(std::future_error(std::future_errc::broken_promise));
-			}
-		}
-
-	public:
+	template<class type>
+	struct promise : public details::promise_base<type> {
 
 		promise() noexcept = default;
 		
@@ -1783,37 +1806,10 @@ namespace concurrencpp {
 			return *this;
 		}
 
-		~promise() noexcept {
-			break_promise_if_needed();
-		}
-
-		future<T> get_future() {
-			if (m_moved) {
-				throw std::future_error(std::future_errc::no_state);
-			}
-
-			if (m_future_retreived) {
-				throw std::future_error(std::future_errc::future_already_retrieved);
-			}
-
-			if (!static_cast<bool>(m_state)) {
-				create_state();
-			}
-
-			m_future_retreived = true;
-			return future<T>(m_state);
-		}
-
-		template<class ... arguments>
-		void set_value(arguments&& ... args) {
+		template<class ... argument_types>
+		void set_value(argument_types&& ... args) {
 			ensure_state();
-			m_state->set_result(std::forward<arguments>(args)...);
-			m_fulfilled = true;
-		}
-
-		void set_exception(std::exception_ptr exception_pointer) {
-			ensure_state();
-			m_state->set_exception(exception_pointer);
+			m_state->set_result(std::forward<argument_types>(args)...);
 			m_fulfilled = true;
 		}
 
@@ -1826,40 +1822,8 @@ namespace concurrencpp {
 	};
 
 	template<>
-	class promise<void> : public details::promise_base {
+	struct promise<void> : public details::promise_base<void> {
 
-	private:
-		std::shared_ptr<details::future_associated_state<void>> m_state;
-
-		void create_state() {
-			details::pool_allocator<details::future_associated_state<void>> allocator;
-			m_state = std::allocate_shared<details::future_associated_state<void>>(allocator);
-		}
-
-		void ensure_state() {
-			if (m_moved) {
-				throw std::future_error(std::future_errc::no_state);
-			}
-
-			if (m_fulfilled) {
-				throw std::future_error(std::future_errc::promise_already_satisfied);
-			}
-
-			if (!m_state) {
-				create_state();
-			}
-		}
-
-		void break_promise_if_needed() {
-			if (static_cast<bool>(m_state) &&
-				!m_fulfilled &&
-				!m_state->has_deffered_task()) {
-				m_state->set_exception(std::make_exception_ptr(std::future_error(std::future_errc::broken_promise)));
-			}
-		}
-
-
-	public:
 		promise() noexcept = default;
 
 		promise(promise&& rhs) noexcept {
@@ -1875,36 +1839,9 @@ namespace concurrencpp {
 			return *this;
 		}
 
-		~promise() noexcept {
-			break_promise_if_needed();
-		}
-
-		future<void> get_future() {
-			if (m_moved) {
-				throw std::future_error(std::future_errc::no_state);
-			}
-
-			if (m_future_retreived) {
-				throw std::future_error(std::future_errc::future_already_retrieved);
-			}
-
-			if (!static_cast<bool>(m_state)) {
-				create_state();
-			}
-
-			m_future_retreived = true;
-			return future<void>(m_state);
-		}
-
 		void set_value() {
 			ensure_state();
 			m_state->set_result();
-			m_fulfilled = true;
-		}
-
-		void set_exception(std::exception_ptr exception_pointer) {
-			ensure_state();
-			m_state->set_exception(exception_pointer);
 			m_fulfilled = true;
 		}
 
@@ -2209,25 +2146,13 @@ namespace concurrencpp {
 
 		template<class ignored_type = void>
 		static future<void> delay(size_t due_time) {
+			::concurrencpp::promise<void> promise;
+			auto future = promise.get_future();
+			once(due_time, [promise = std::move(promise)]() mutable {
+				promise.set_value();
+			});
 
-			struct delayer {
-
-				size_t due_time;
-
-				delayer(size_t due_time) noexcept : due_time(due_time) {}
-
-				bool await_ready() const noexcept { return false; }
-
-				void await_suspend(std::experimental::coroutine_handle<void> coro_handle) const {
-					timer::once(due_time, coro_handle);
-				}
-
-				void await_resume() const noexcept {}
-
-			};
-
-			delayer delayer(due_time);
-			co_await delayer;
+			return future;
 		}
 
 	};
