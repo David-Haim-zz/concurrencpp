@@ -445,7 +445,7 @@ namespace concurrencpp {
 	}
 
 	template<class T> class future;
-	template<class T> class promise;
+	template<class T> struct promise;
 
 	namespace details {
 
@@ -932,6 +932,15 @@ namespace concurrencpp {
 			bool has_continuation() const noexcept {
 				return static_cast<bool>(m_then);
 			}
+
+			void set_exception(std::exception_ptr exception_pointer, void* exception_storage) {
+				std::unique_lock<decltype(m_lock)> lock(m_lock);
+				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
+				new (exception_storage) std::exception_ptr(std::move(exception_pointer));
+				m_state = future_result_state::EXCEPTION;
+				call_continuation();
+			}
+
 		};
 
 		template<class type>
@@ -969,18 +978,10 @@ namespace concurrencpp {
 				call_continuation();
 			}
 
-			template<class exception>
-			void set_exception(exception&& given_exception) {
-				set_exception(std::make_exception_ptr(std::forward<exception>(given_exception)));
-			}
-
 			void set_exception(std::exception_ptr exception_pointer) {
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
-				new (std::addressof(m_result.exception))
-					std::exception_ptr(std::move(exception_pointer));
-				m_state = future_result_state::EXCEPTION;
-				call_continuation();
+				future_associated_state_base::set_exception(
+					std::move(exception_pointer),
+					std::addressof(m_result.exception));
 			}
 
 			type result_or_exception() {
@@ -1021,11 +1022,6 @@ namespace concurrencpp {
 				call_continuation();
 			}
 
-			template<class exception>
-			void set_exception(exception&& given_exception) {
-				set_exception(std::make_exception_ptr(std::forward<exception>(given_exception)));
-			}
-
 			void set_result() {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
@@ -1052,10 +1048,10 @@ namespace concurrencpp {
 
 		};
 
-		template<class T>
-		class future_associated_state<T&> : public future_associated_state_base {
+		template<class type>
+		class future_associated_state<type&> : public future_associated_state_base {
 
-			compressed_future_result<T&> m_result;
+			compressed_future_result<type&> m_result;
 
 		public:
 
@@ -1067,7 +1063,7 @@ namespace concurrencpp {
 				}
 			}
 
-			void set_result(T& reference) {
+			void set_result(type& reference) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
 				m_result.result = std::addressof(reference);
@@ -1075,26 +1071,19 @@ namespace concurrencpp {
 				call_continuation();
 			}
 
-			template<class exception>
-			void set_exception(exception&& given_exception) {
-				set_exception(std::make_exception_ptr(std::forward<exception>(given_exception)));
-			}
 
 			void set_exception(std::exception_ptr exception_pointer) {
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				assert(m_state == future_result_state::NOT_READY || m_state == future_result_state::DEFFERED);
-				new (std::addressof(m_result.exception))
-					std::exception_ptr(std::move(exception_pointer));
-				m_state = future_result_state::EXCEPTION;
-				call_continuation();
+				future_associated_state_base::set_exception(
+					std::move(exception_pointer),
+					std::addressof(m_result.exception));
 			}
 
-			T& result_or_exception() {
+			type& result_or_exception() {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 				return result_or_exception_unlocked();
 			}
 
-			T& result_or_exception_unlocked() {
+			type& result_or_exception_unlocked() {
 				assert(m_state != future_result_state::NOT_READY);
 
 				if (m_state == future_result_state::EXCEPTION) {
@@ -1105,7 +1094,7 @@ namespace concurrencpp {
 				return *m_result.result;
 			}
 
-			T& get() {
+			type& get() {
 				wait();
 				return result_or_exception_unlocked();
 			}
@@ -1158,12 +1147,9 @@ namespace concurrencpp {
 
 		template<class future_type, class callback_type>
 		auto make_future_then(
-			std::shared_ptr<future_associated_state<future_type>> future_state,
+			const std::shared_ptr<future_associated_state<future_type>>& future_state,
 			callback_type&& callback) {
-			auto then_ptr = new future_then<future_type, callback_type>{
-				future_state,
-				std::forward<callback_type>(callback)
-			};
+			auto then_ptr = new future_then<future_type, callback_type>(future_state, std::forward<callback_type>(callback));
 
 			std::unique_ptr<callback_base> type_erased(then_ptr);
 			auto new_future = then_ptr->get_future();
@@ -1228,7 +1214,7 @@ namespace concurrencpp {
 				if (static_cast<bool>(m_state) &&
 					!m_fulfilled &&
 					!m_state->has_deffered_task()) {
-					m_state->set_exception(std::future_error(std::future_errc::broken_promise));
+					m_state->set_exception(std::make_exception_ptr(std::future_error(std::future_errc::broken_promise)));
 				}
 			}
 
@@ -1292,8 +1278,7 @@ namespace concurrencpp {
 			function_type m_function;
 
 		public:
-			async_state(function_type&& function) :
-				m_function(std::forward<function_type>(function)) {}
+			async_state(function_type&& function) : m_function(std::forward<function_type>(function)) {}
 
 			auto get_future() {
 				return m_promise.get_future();
@@ -1320,18 +1305,18 @@ namespace concurrencpp {
 		}
 
 		struct thread_pool_scheduler {
-			template<class T>
-			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
+			template<class type>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<type>* state) {
 				auto& thread_pool = ::concurrencpp::details::thread_pool::default_instance();
 				thread_pool.enqueue_task(std::move(task));
 			}
 		};
 
 		struct thread_scheduler {
-			template<class T>
-			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
-				::std::thread execution_thread([_task = std::move(task)]() mutable {
-					_task->execute();
+			template<class type>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<type>* state) {
+				::std::thread execution_thread([task = std::move(task)]() mutable {
+					task->execute();
 				});
 
 				execution_thread.detach();
@@ -1339,8 +1324,8 @@ namespace concurrencpp {
 		};
 
 		struct deffered_schedueler {
-			template<class T>
-			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<T>* state) {
+			template<class type>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<type>* state) {
 				state->set_deffered_task(std::move(task));
 			}
 		};
@@ -1364,11 +1349,6 @@ namespace concurrencpp {
 				m_promise.set_exception(exception);
 			}
 
-			template<class exception_type>
-			void set_exception(exception_type&& exception) {
-				m_promise.set_exception(std::forward<exception_type>(exception));
-			}
-
 		};
 
 		class timer_impl {
@@ -1389,8 +1369,6 @@ namespace concurrencpp {
 				SCHEDULE_DELETE,
 				IDLE
 			};
-
-		public:
 
 			inline timer_impl(const size_t due_time, const size_t frequency, const bool is_oneshot) noexcept :
 				m_due_time(due_time),
@@ -1562,7 +1540,7 @@ namespace concurrencpp {
 					timer->execute();
 				};
 
-				for (auto i = 0ul; i < m_running_timers.size(); i++) {
+				for (size_t i = 0; i < m_running_timers.size(); i++) {
 					auto& timer = m_running_timers[i];
 					const auto chrono_interval =
 						std::chrono::system_clock::now().time_since_epoch() -
@@ -1698,7 +1676,7 @@ namespace concurrencpp {
 	class future {
 
 		template<class type> friend class ::concurrencpp::details::future_associated_state;
-		template<class type> friend class ::concurrencpp::promise;
+		template<class type> friend struct ::concurrencpp::promise;
 		template<class type> friend auto& details::get_inner_state(type& state_holder) noexcept;
 
 	private:
@@ -1721,9 +1699,7 @@ namespace concurrencpp {
 		future(const future& rhs) = delete;
 		future& operator = (const future&) = delete;
 
-		bool valid() const noexcept {
-			return static_cast<bool>(m_state);
-		}
+		bool valid() const noexcept { return static_cast<bool>(m_state); }
 
 		void wait() {
 			throw_if_empty();
