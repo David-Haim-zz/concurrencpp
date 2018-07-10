@@ -1,23 +1,23 @@
 /*
-Copyright (c) 2017 David Haim
+	Copyright (c) 2017 David Haim
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+	The above copyright notice and this permission notice shall be included in all
+	copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+	SOFTWARE.
 */
 
 #ifndef CONCURRENCPP_H
@@ -30,6 +30,7 @@ SOFTWARE.
 #include <memory>
 #include <chrono>
 #include <cassert>
+#include <type_traits>
 
 #include <atomic>
 #include <thread>
@@ -750,10 +751,12 @@ namespace concurrencpp {
 
 		class future_associated_state_base {
 
+			using callback_ptr = ::std::unique_ptr<::concurrencpp::details::callback_base>;
+
 		protected:
 			//members are ordered in the order of their importance.
 			mutable recursive_spinlock m_lock;
-			std::unique_ptr<callback_base> m_then;
+			callback_ptr m_action; //linked list of actions to perform when result is set
 			future_result_state m_state;
 			mutable std::unique_ptr<std::condition_variable_any> m_condition; //lazy creation
 
@@ -769,6 +772,45 @@ namespace concurrencpp {
 				}
 
 				m_condition.reset(cv);
+			}
+
+			void execute_action_list() {
+				while (static_cast<bool>(m_action)) {
+					m_action->execute();
+					auto current = std::move(m_action);
+					m_action = std::move(current->next);
+				}
+			}
+
+			void add_continuation_to_back(callback_ptr continuation) noexcept {
+				if (!static_cast<bool>(m_action)) {
+					m_action = std::move(continuation);
+					return;
+				}
+
+				auto cursor = &m_action;
+				while (static_cast<bool>((**cursor).next)) { cursor = &((**cursor).next); }
+
+				(**cursor).next = std::move(continuation);
+			}
+
+			void add_continuation_to_front(callback_ptr continuation) noexcept {
+				if (!static_cast<bool>(m_action)) {
+					m_action = std::move(continuation);
+					return;
+				}
+
+				auto temp = std::move(m_action);
+				m_action = std::move(continuation);
+				m_action->next = std::move(temp);
+			}
+
+			void add_continuation_impl(callback_ptr continuation, bool push_back) noexcept {
+				if (push_back) { 
+					return add_continuation_to_back(std::move(continuation)); 
+				}
+				
+				add_continuation_to_front(std::move(continuation));
 			}
 
 		public:
@@ -824,11 +866,22 @@ namespace concurrencpp {
 				{
 					std::unique_lock<decltype(m_lock)> lock(m_lock);
 					if (m_state == future_result_state::DEFFERED) {
-						auto deffered_task = std::move(m_then);
-						m_then = std::move(deffered_task->next);
-						deffered_task->execute();
-						deffered_task.reset();
-						call_continuation();
+						assert(static_cast<bool>(m_action));
+
+						/*
+							We must detach m_action from itself, 
+							because if we call execute_action_list directly, async_state will set the result 
+						i	in the stored promise, calling execute_action_list recursivly and executing the same callback
+						*/
+						auto task = std::move(m_action);
+						m_action = std::move(task->next);
+						task->execute();
+						execute_action_list();
+						
+						if (static_cast<bool>(m_condition)) {
+							m_condition->notify_all();	
+						}
+						
 						assert(m_state != future_result_state::DEFFERED);
 						assert(m_state != future_result_state::NOT_READY);
 						return;
@@ -838,20 +891,12 @@ namespace concurrencpp {
 				while (wait_for(std::chrono::hours(365 * 24)) == std::future_status::timeout);
 			}
 
-			void set_continuation(std::unique_ptr<callback_base> continuation) {
+			void add_continuation(std::unique_ptr<callback_base> continuation, bool push_back) {	
 				{
 					std::unique_lock<decltype(m_lock)> lock(m_lock);
 
-					if (m_state == future_result_state::DEFFERED) {
-						assert(m_then->next.get() == nullptr);
-						m_then->next = std::move(continuation);
-						return;
-					}
-
-					if (m_state == future_result_state::NOT_READY) {
-						assert(!static_cast<bool>(m_then));
-						m_then = std::move(continuation);
-						return;
+					if (m_state == future_result_state::DEFFERED || m_state == future_result_state::NOT_READY) {
+						return add_continuation_impl(std::move(continuation), true);
 					}
 				}
 
@@ -862,39 +907,6 @@ namespace concurrencpp {
 
 			bool has_deffered_task() const noexcept {
 				return m_state == future_result_state::DEFFERED;
-			}
-
-			template<class function_type>
-			void wrap_continuation(function_type&& callback) noexcept {
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-
-				if (m_state != future_result_state::NOT_READY) {
-					//nothing to wrap, just call the callback
-					callback();
-					return;
-				}
-
-				std::unique_ptr<callback_base> new_then;
-				auto then = std::move(m_then);
-
-				if (static_cast<bool>(then)) {
-					new_then = make_callback([
-						then = std::move(then),
-							callback = std::forward<function_type>(callback)]() mutable{
-							callback();
-							then->execute();
-						});
-				}
-				else {
-					new_then = make_callback([
-						callback = std::forward<function_type>(callback)]() mutable{
-							callback();
-						});
-				}
-
-				assert(static_cast<bool>(new_then));
-				assert(!static_cast<bool>(m_then));
-				m_then = std::move(new_then);
 			}
 
 			bool is_ready() const noexcept {
@@ -909,10 +921,7 @@ namespace concurrencpp {
 					//do not reset the CV, as other objects wait on it on another thread.
 				}
 
-				if (static_cast<bool>(m_then)) {
-					m_then->execute();
-					m_then.reset();
-				}
+				execute_action_list();
 			}
 
 			void set_deffered_task(std::unique_ptr<callback_base> task) noexcept {
@@ -923,15 +932,13 @@ namespace concurrencpp {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
 
 				assert(m_state == future_result_state::NOT_READY);
-				assert(!static_cast<bool>(m_then));
+				assert(!static_cast<bool>(m_action));
 
-				m_then = std::move(task);
+				add_continuation_to_back(std::move(task));
 				m_state = future_result_state::DEFFERED;
 			}
 
-			bool has_continuation() const noexcept {
-				return static_cast<bool>(m_then);
-			}
+			bool has_continuation() const noexcept { return static_cast<bool>(m_action); }
 
 			void set_exception(std::exception_ptr exception_pointer, void* exception_storage) {
 				std::unique_lock<decltype(m_lock)> lock(m_lock);
@@ -1118,17 +1125,14 @@ namespace concurrencpp {
 			void execute_impl(std::true_type) {
 				m_callback(future_type(std::move(m_future_state)));
 				m_promise.set_value();
-			}
+			}	
 
 			void execute_impl(std::false_type) {
 				m_promise.set_value(m_callback(future_type(std::move(m_future_state))));
 			}
 
-		public:
-			
-			future_then(decltype(m_future_state) state, callback_type&& callback) :
-				m_future_state(std::move(state)),
-				m_callback(std::forward<callback_type>(callback)) {}
+		public:	
+			future_then(callback_type&& callback) : m_callback(std::forward<callback_type>(callback)) {}
 
 			virtual void execute() override final {
 				try {
@@ -1139,24 +1143,24 @@ namespace concurrencpp {
 				}
 			}
 
-			auto get_future() {
-				return m_promise.get_future();
-			}
+
+			void set_original_state(decltype(m_future_state) state) noexcept { m_future_state = std::move(state); }
+			auto get_future() { return m_promise.get_future(); }
 
 		};
 
 		template<class future_type, class callback_type>
 		auto make_future_then(
-			const std::shared_ptr<future_associated_state<future_type>>& future_state,
+			std::shared_ptr<future_associated_state<future_type>> future_state,
 			callback_type&& callback) {
-			auto then_ptr = new future_then<future_type, callback_type>(future_state, std::forward<callback_type>(callback));
+			auto then_ptr = new future_then<future_type, callback_type>(std::forward<callback_type>(callback));
 
 			std::unique_ptr<callback_base> type_erased(then_ptr);
 			auto new_future = then_ptr->get_future();
 
 			assert(future_state.get() != nullptr); //should have been passed by value.
-			future_state->set_continuation(std::move(type_erased));
-
+			future_state->add_continuation(std::move(type_erased), true);
+			then_ptr->set_original_state(std::move(future_state));
 			return new_future;
 		}
 
@@ -1173,7 +1177,7 @@ namespace concurrencpp {
 
 			template<class coroutine_handle>
 			void await_suspend(coroutine_handle&& handle) {
-				m_state.set_continuation(make_callback(std::forward<coroutine_handle>(handle)));
+				m_state.add_continuation(make_callback(std::forward<coroutine_handle>(handle)), true);
 			}
 
 			type await_resume() { return m_state.get(); }
@@ -1280,9 +1284,7 @@ namespace concurrencpp {
 		public:
 			async_state(function_type&& function) : m_function(std::forward<function_type>(function)) {}
 
-			auto get_future() {
-				return m_promise.get_future();
-			}
+			auto get_future() { return m_promise.get_future(); }
 
 			virtual void execute() override final {
 				try {
@@ -1483,8 +1485,7 @@ namespace concurrencpp {
 				due_time,
 				frequency,
 				is_oneshot, 
-				std::bind(std::forward<function_type>(function),
-					std::forward<arguments>(args)...));
+				std::bind(std::forward<function_type>(function), std::forward<arguments>(args)...));
 		}
 
 		class timer_queue {
@@ -1496,6 +1497,7 @@ namespace concurrencpp {
 			std::mutex m_lock;
 			std::condition_variable m_condition;
 			std::chrono::system_clock::time_point m_last_time_point;
+			thread_pool& m_thread_pool;
 			bool m_is_running;
 
 			inline void remove_timer(size_t index) {
@@ -1535,10 +1537,7 @@ namespace concurrencpp {
 				}
 
 				auto minimum_fire_time = m_running_timers[0]->next_fire_time();
-				auto& thread_pool = thread_pool::default_instance();
-				auto callback = [](timer_ptr timer) {
-					timer->execute();
-				};
+				auto callback = [](timer_ptr timer) { timer->execute(); };
 
 				for (size_t i = 0; i < m_running_timers.size(); i++) {
 					auto& timer = m_running_timers[i];
@@ -1556,12 +1555,12 @@ namespace concurrencpp {
 					switch (status) {
 
 					case timer_impl::status::SCHEDULE: {
-						thread_pool.enqueue_task(callback, timer);
+						m_thread_pool.enqueue_task(callback, timer);
 						break;
 					}
 
 					case timer_impl::status::SCHEDULE_DELETE: {
-						thread_pool.enqueue_task(callback, timer);
+						m_thread_pool.enqueue_task(callback, timer);
 						remove_timer(i);
 						--i;
 						break;
@@ -1586,6 +1585,7 @@ namespace concurrencpp {
 		public:
 
 			timer_queue() :
+				m_thread_pool(thread_pool::default_instance()),
 				m_is_running(true),
 				m_last_time_point(std::chrono::system_clock::now()) {}
 
@@ -1599,18 +1599,19 @@ namespace concurrencpp {
 			}
 
 			void work_loop() {
+				//predicate which returns ​false if the waiting should be continued. 
+				auto pred = [this] {
+					if (!m_is_running) {
+						return true; //break the work loop
+					}
+
+					//if there are no queued timers, then go back to sleep.
+					return !m_queued_timers.empty();
+				};
+
 				while (true) {
 					auto next_fire_time = process_running_timers();
 					next_fire_time = std::min(next_fire_time, add_queued_timers());
-
-					auto pred = [this] {
-						if (!m_is_running) {
-							return true; //break the work loop
-						}
-
-						//if there are no queued timers, then go back to sleep.
-						return !m_queued_timers.empty();
-					};
 
 					next_fire_time =
 						(next_fire_time == std::numeric_limits<size_t>::max()) ?
@@ -1618,11 +1619,8 @@ namespace concurrencpp {
 						next_fire_time;
 
 					std::unique_lock<decltype(m_lock)> lock(m_lock);
-					m_condition.wait_for(
-						lock,
-						std::chrono::milliseconds(next_fire_time),
-						pred);
-
+					m_condition.wait_for(lock, std::chrono::milliseconds(next_fire_time), pred);
+		
 					if (!m_is_running) {
 						return;
 					}
@@ -1727,7 +1725,7 @@ namespace concurrencpp {
 		template<class continuation_type>
 		auto then(continuation_type&& continuation) {
 			throw_if_empty();
-			return make_future_then(m_state, std::forward<continuation_type>(continuation));
+			return make_future_then(std::move(m_state), std::forward<continuation_type>(continuation));
 		}
 
 		auto operator co_await() {
@@ -2045,12 +2043,6 @@ namespace concurrencpp {
 
 			auto& timer_queue_container =
 				details::timer_queue_container::default_instance();
-
-			/*
-				if for some reason we fail to build a threadpool
-				let the exception be thrown synchronously on the caller thread.
-			*/
-			auto& thread_pool = details::thread_pool::default_instance();
 
 			timer_ptr = details::make_timer_impl(
 				due_time,
