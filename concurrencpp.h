@@ -946,7 +946,8 @@ namespace concurrencpp {
 				}
 
 				if (static_cast<bool>(m_then)) {
-					return m_then->execute();
+					auto then = std::move(m_then); //make sure then is released either way.
+					then->execute();
 				}
 			}
 		};
@@ -1114,7 +1115,11 @@ namespace concurrencpp {
 			future_awaiter(decltype(m_state) state, decltype(m_future) future) noexcept : m_state(state), m_future(future)  {}
 
 			bool await_ready() const noexcept { return m_state.is_ready(); }
-			type await_resume() { return m_state.get(); }
+			type await_resume() { 
+				//we don't have to synchronize the result again. await_resume is called from "call_continuation -> coro_handle()"
+				//and this function already uses the future lock.
+				return m_state.result_or_exception_unlocked(); 
+			}
 
 			template<class coroutine_handle>
 			void await_suspend(coroutine_handle&& handle) {
@@ -1123,6 +1128,20 @@ namespace concurrencpp {
 			}
 		};
 
+		template<class result_type, class ... argument_types>
+		future<result_type> make_ready_future_impl(std::false_type, argument_types&& ... args) {
+			::concurrencpp::promise<result_type> promise;
+			promise.set_value(std::forward<argument_types>(args)...);
+			return promise.get_future();
+		}
+
+		template<class result_type, class ... argument_types>
+		future<result_type> make_ready_future_impl(std::true_type, argument_types&& ... args) {
+			static_assert(sizeof...(args) == 0, "concurrencpp::make_ready_future<void> doesn't get any parameters");
+			::concurrencpp::promise<result_type> promise;
+			promise.set_value();
+			return promise.get_future();
+		}
 		template<class type>
 		class promise_base {
 
@@ -1633,16 +1652,8 @@ namespace concurrencpp {
 
 	template<class result_type, class ... argument_types>
 	future<result_type> make_ready_future(argument_types&& ... args) {
-		promise<result_type> promise;
-		promise.set_value(std::forward<argument_types>(args)...);
-		return promise.get_future();
-	}
-
-	template<class type = void>
-	future<void> make_ready_future() {
-		promise<void> promise;
-		promise.set_value();
-		return promise.get_future();
+		using bool_type = typename std::is_same<result_type, void>::type;
+		return details::make_ready_future_impl<result_type>(bool_type{}, std::forward<argument_types>(args)...);
 	}
 	
 	template<class result_type, class exception_type, class ... argument_types>
@@ -1898,6 +1909,10 @@ namespace concurrencpp {
 			details::when_any_once(state, 0, std::forward<types>(future_types)...);
 			return state->promise.get_future();
 		}
+	}
+
+	inline future<::std::tuple<>> when_all() {
+		return ::concurrencpp::make_ready_future<::std::tuple<>>();
 	}
 
 	template<class ... future_types>
