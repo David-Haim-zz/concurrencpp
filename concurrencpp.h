@@ -456,8 +456,7 @@ namespace concurrencpp {
 
 		template<class function_type>
 		std::unique_ptr<callback_base> make_callback(function_type&& function) {
-			return std::unique_ptr<callback_base>(
-				new callback<function_type>(std::forward<function_type>(function)));
+			return std::unique_ptr<callback_base>(new callback<function_type>(std::forward<function_type>(function)));
 		}
 
 		class work_queue {
@@ -497,9 +496,7 @@ namespace concurrencpp {
 				return task;
 			}
 
-			bool empty() const noexcept {
-				return !static_cast<bool>(m_head);
-			}
+			bool empty() const noexcept { return !static_cast<bool>(m_head); }
 
 		};
 
@@ -594,17 +591,9 @@ namespace concurrencpp {
 				}
 			}
 
-			void notify() {
-				m_condition.notify_one();
-			}
-
-			void join() {
-				m_worker.join();
-			}
-
-			std::thread::id get_id() const noexcept {
-				return m_worker.get_id();
-			}
+			void notify() { m_condition.notify_one(); }
+			void join() { m_worker.join(); }
+			std::thread::id get_id() const noexcept { return m_worker.get_id(); }
 		};
 
 		class thread_pool {
@@ -616,7 +605,7 @@ namespace concurrencpp {
 
 			size_t choose_next_worker() noexcept {
 				static thread_local size_t counter = 0;
-				return ++counter % m_workers.size();
+				return (++counter) % m_workers.size();
 			}
 
 			worker_thread* get_self_worker_impl() noexcept {
@@ -631,8 +620,7 @@ namespace concurrencpp {
 			}
 
 			worker_thread* get_self_worker() noexcept {
-				static thread_local auto cached_worker_thread =
-					get_self_worker_impl();
+				static thread_local auto cached_worker_thread = get_self_worker_impl();
 				return cached_worker_thread;
 			}
 
@@ -1858,57 +1846,6 @@ namespace concurrencpp {
 			auto get_future() { return m_promise.get_future(); }
 		};
 
-		struct when_any_state {
-			::std::atomic_bool fulfilled;
-			::concurrencpp::promise<size_t> promise;
-
-			when_any_state() noexcept : fulfilled(false) {}
-
-			void on_task_finished(size_t index) {
-				const auto _fulfilled = std::atomic_exchange_explicit(
-					&fulfilled,
-					true,
-					std::memory_order_acquire);
-
-				if (_fulfilled == false) { //this is the first finished task
-					promise.set_value(index);
-				}
-			}
-		};
-
-		inline void when_any_once(const std::shared_ptr<when_any_state>& state, size_t task_index) noexcept {}
-
-		template<class type, class ... types>
-		void when_any_once(
-			std::shared_ptr<when_any_state> state,
-			size_t task_index,
-			::concurrencpp::future<type>& future,
-			types&& ... future_types) {
-
-			if (!future.valid()) {
-				throw std::future_error(std::future_errc::no_state);
-			}
-
-			if (future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-				state->on_task_finished(task_index);
-				return;
-			}
-
-			auto& inner_state = get_inner_state(future);
-			inner_state->wrap_continuation([state = state, task_index] {
-				state->on_task_finished(task_index);
-			});
-
-			when_any_once(std::move(state), task_index + 1, std::forward<types>(future_types)...);
-		}
-
-		template<class ... types>
-		future<size_t> when_any_wrapper(types&& ... future_types) {
-			pool_allocator<when_any_state> allocator;
-			auto state = std::allocate_shared<when_any_state>(allocator);
-			details::when_any_once(state, 0, std::forward<types>(future_types)...);
-			return state->promise.get_future();
-		}
 	}
 
 	inline future<::std::tuple<>> when_all() {
@@ -1918,16 +1855,96 @@ namespace concurrencpp {
 	template<class ... future_types>
 	future<std::tuple<typename std::decay<future_types>::type...>>
 		when_all(future_types&& ... futures) {
-		auto when_all_state = 
-			details::make_shared<details::when_all_state<typename std::decay<future_types>::type...>>();
+		auto when_all_state = details::make_shared<details::when_all_state<typename std::decay<future_types>::type...>>();
 		when_all_state->set_futures(std::forward<future_types>(futures)...);
 		return when_all_state->get_future();
 	}
+}
+
+namespace concurrencpp {
+	
+	template <class sequence_type>
+	struct when_any_result {
+		const std::size_t index;
+		sequence_type futures;
+
+		when_any_result() noexcept : index(static_cast<size_t>(-1)) {}
+
+		template<class ... future_types>
+		when_any_result(size_t index, future_types&& ... futures) noexcept:
+			index(index),
+			futures(std::forward<future_types>(futures)...) {}
+
+	};
+
+	namespace details {
+
+		template<class sequence_type>
+		class when_any_state : public std::enable_shared_from_this<when_any_state<sequence_type>>{
+			
+		private:
+			::std::atomic_bool m_fulfilled;
+			::concurrencpp::promise<::concurrencpp::when_any_result<sequence_type>> m_promise;
+			sequence_type m_futures;
+
+			template<class type>
+			type on_task_finished(::concurrencpp::future<type> future, size_t index) {
+				const auto fulfilled = std::atomic_exchange_explicit(
+					&m_fulfilled,
+					true,
+					std::memory_order_acquire);
+
+				if (fulfilled == false) { //this is the first finished task
+					m_promise.set_value(index, std::move(m_futures));
+				}
+
+				return future.get();
+			}
+
+			template<size_t index, class type>
+			void set_future(::concurrencpp::future<type>& future) noexcept {
+				assert(future.valid());
+				std::get<index>(m_futures) = 
+					future.then([_this = shared_from_this()](::concurrencpp::future<type> future) mutable {
+					return _this->on_task_finished(std::move(future), index);
+				});
+			}
+
+			template<size_t index> void set_futures() const noexcept {}
+
+			template<size_t index, class future_type, class ... future_types>
+			void set_futures(future_type&& future, future_types&& ... futures) noexcept {
+				set_future<index>(std::forward<future_type>(future));
+				set_futures<index + 1>(std::forward<future_types>(futures)...);
+			}
+
+		public:
+
+			when_any_state() noexcept : m_fulfilled(false) {}
+			auto get_future() { return m_promise.get_future(); }
+
+			template<class ... future_types>
+			void set_futures(future_types&& ... futures) noexcept {
+				set_futures<0>(std::forward<future_types>(futures)...);
+			}
+		};
+	}
+
+	inline future<when_any_result<::std::tuple<>>> when_any() {
+		return make_ready_future<when_any_result<::std::tuple<>>>();
+	}
 
 	template<class ... future_types>
-	future<size_t> when_any(future_types&& ... futures) {
-		return details::when_any_wrapper(std::forward<future_types>(futures)...);
+	auto when_any(future_types&& ... futures) {
+		using tuple_t = std::tuple<std::decay_t<future_types>...>;
+		auto state = details::make_shared<details::when_any_state<tuple_t>>();
+		state->set_futures(std::forward<future_types>(futures)...);
+		return state->get_future();
 	}
+
+}
+
+namespace concurrencpp {
 
 	class timer {
 
@@ -2005,7 +2022,6 @@ namespace concurrencpp {
 		template<class function_type, class ... arguments_type>
 		static void once(size_t due_time, function_type&& function, arguments_type&& ... args) {
 			std::shared_ptr<details::timer_impl> ignored;
-
 			init_timer(
 				ignored,
 				due_time,
@@ -2033,36 +2049,28 @@ namespace std {
 	namespace experimental {
 
 		template<class type, class... arguments>
-		struct coroutine_traits<::concurrencpp::future<type>, arguments...> {
-			
+		struct coroutine_traits<::concurrencpp::future<type>, arguments...> {	
 			struct promise_type : 
 				public concurrencpp::details::promise_type_base<type> ,
 				public concurrencpp::details::pool_allocated {
 
 				template<class return_type>
-				void return_value(return_type&& value) {
-					m_promise.set_value(std::forward<return_type>(value));
-				}
-
+				void return_value(return_type&& value) { m_promise.set_value(std::forward<return_type>(value)); }
 			};
 		};
 
 		template<class... arguments>
 		struct coroutine_traits<::concurrencpp::future<void>, arguments...> {
-
 			struct promise_type :
-				public concurrencpp::details::promise_type_base<void> ,
+				public concurrencpp::details::promise_type_base<void>,
 				public concurrencpp::details::pool_allocated {
 
-				void return_void() {
-					m_promise.set_value();
-				}
+				void return_void() { m_promise.set_value(); }
 			};
 		};
 
 		template<class ... arguments>
 		struct coroutine_traits<void, arguments...> {
-
 			struct promise_type : public concurrencpp::details::pool_allocated {
 				promise_type() noexcept {}
 				void get_return_object() noexcept {}
@@ -2072,11 +2080,10 @@ namespace std {
 
 				template<class exception_type>
 				void set_exception(exception_type&& exception) noexcept {}
-
 			};
 		};
 
-	}//experimental
-}//std
+	}	//experimental
+}	//std
 
 #endif
