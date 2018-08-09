@@ -1,5 +1,5 @@
 /*
-	Copyright (c) 2017 David Haim
+	Copyright (c) 2017 - 2018 David Haim
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -100,7 +100,10 @@ namespace concurrencpp {
 				while (try_lock_once([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }) == false);
 			}
 
-			void unlock() noexcept { m_lock.store(unlocked, std::memory_order_release); }
+			void unlock() noexcept { 
+				assert(m_lock.load(std::memory_order_acquire) == locked);
+				m_lock.store(unlocked, std::memory_order_release); 
+			}
 
 			bool try_lock() noexcept {
 				return std::atomic_exchange_explicit(
@@ -162,7 +165,7 @@ namespace concurrencpp {
 
 		public:
 
-			block_list() noexcept : m_head(nullptr), m_block_count(0ul) {}
+			block_list() noexcept : m_head(nullptr), m_block_count(0) {}
 			~block_list() noexcept { clear(); }
 
 			void clear() noexcept {
@@ -178,6 +181,8 @@ namespace concurrencpp {
 			}
 
 			void* allocate() noexcept {
+				assert(m_block_count == 0 ? (m_head == nullptr) : (m_head != nullptr));
+
 				if (m_head == nullptr) {
 					return nullptr;
 				}
@@ -186,15 +191,12 @@ namespace concurrencpp {
 				m_head = m_head->next;
 				--m_block_count;
 
-				assert(m_block_count == 0 ?
-					(m_head == nullptr) :
-					(m_head != nullptr));
-
+				block->~memory_block();
 				return block;
 			}
 
-			void deallocate(void* chunk) noexcept{
-				auto block = static_cast<memory_block*>(chunk);
+			void deallocate(void* chunk) noexcept {
+				auto block = new (chunk) memory_block();
 				block->next = m_head;
 				m_head = block;
 				++m_block_count;
@@ -214,40 +216,16 @@ namespace concurrencpp {
 
 		private:
 			std::vector<pool_type> m_pools;
+			static constexpr size_t s_aligned_sizes[] = { 32, 64 , 96, 128, 192, 256, 384, 512 };
 
 			static size_t calculate_pool_size() noexcept {
 				const auto number_of_cpus = std::thread::hardware_concurrency();
 				return (number_of_cpus == 0) ? DEFAULT_POOL_SIZE : number_of_cpus;
 			}
-			
-			static size_t align_size(const size_t unaligned_size) noexcept {
-				if (unaligned_size <= 32) {
-					return 32;
-				}
-				else if (unaligned_size <= 64) {
-					return 64;
-				}
-				else if (unaligned_size <= 96) {
-					return 96;
-				}
-				else if (unaligned_size <= 128) {
-					return 128;
-				}
-				else if (unaligned_size <= 192) {
-					return 192;
-				}
-				else if (unaligned_size <= 256) {
-					return 256;
-				}
-				else if (unaligned_size <= 384) {
-					return 384;
-				}
-				else if (unaligned_size <= 512) {
-					return 512;
-				}
 
-				assert(false);
-				return static_cast<size_t>(-1);
+			static size_t align_size(const size_t bucket_index) noexcept {
+				assert(bucket_index < std::size(s_aligned_sizes));
+				return s_aligned_sizes[bucket_index];
 			}
 
 			static size_t find_bucket_index(const size_t unaligned_size) noexcept {
@@ -285,13 +263,13 @@ namespace concurrencpp {
 				return s_memory_pool;
 			}
 
-			static size_t get_pool_index(size_t number_of_pools) {
-				static thread_local const size_t index = [] {
-					auto this_thread_id = std::this_thread::get_id();
-					std::hash<decltype(this_thread_id)> hasher;
-					return hasher(this_thread_id) % instance().m_pools.size();
-				}();
+			static size_t get_pool_index_impl(size_t number_of_pools) noexcept {
+				static std::atomic_size_t counter = 0;
+				return counter.fetch_add(1, std::memory_order_acq_rel) % number_of_pools;
+			}
 
+			static size_t get_pool_index(size_t number_of_pools) noexcept {
+				static thread_local const size_t index = get_pool_index_impl(number_of_pools);
 				return index;
 			}
 
@@ -299,7 +277,7 @@ namespace concurrencpp {
 
 			memory_pool() : m_pools(calculate_pool_size()) {}
 
-			~memory_pool() {
+			~memory_pool() noexcept {
 				for (auto& pool : m_pools) {
 					for (auto& bucket : pool) {
 						std::lock_guard<decltype(bucket.second)> lock(bucket.second);
@@ -323,8 +301,9 @@ namespace concurrencpp {
 
 				auto& _this = instance();
 				auto& pools = _this.m_pools;
-				auto& pool = pools[get_pool_index(pools.size())];
-
+				auto this_thread_index = get_pool_index(pools.size());
+				assert(this_thread_index < pools.size());
+				auto& pool = pools[this_thread_index];
 				const auto bucket_index = find_bucket_index(chunk_size);
 				assert(bucket_index < pool.size());
 				auto& bucket = pool[bucket_index];
@@ -350,7 +329,7 @@ namespace concurrencpp {
 					}
 				}
 
-				chunk_size = align_size(chunk_size);
+				chunk_size = align_size(bucket_index);
 				memory = std::malloc(chunk_size);
 				if (memory != nullptr) {
 					return memory;
@@ -359,23 +338,22 @@ namespace concurrencpp {
 				throw std::bad_alloc();
 			}
 
-			static void deallocate(void* chunk, size_t size) noexcept {
-				assert(size != 0);
+			static void deallocate(void* chunk, size_t chunk_size) noexcept {
+				assert(chunk_size != 0);
 
-				if (size > 512) {
+				if (chunk_size > 512) {
 					std::free(chunk);
 					return;
 				}
 
 				auto& _this = instance();
 				auto& pools = _this.m_pools;
+				auto this_thread_index = get_pool_index(pools.size());
+				assert(this_thread_index < pools.size());
 
-				auto this_thread_id = std::this_thread::get_id();
-				std::hash<decltype(this_thread_id)> hasher;
-				auto pool_index = hasher(this_thread_id) % pools.size();
-				auto& pool = pools[pool_index];
-
-				const auto bucket_index = find_bucket_index(size);
+				auto& pool = pools[this_thread_index];
+				const auto bucket_index = find_bucket_index(chunk_size);
+				assert(bucket_index < pool.size());				
 				auto& bucket = pool[bucket_index];
 
 				std::lock_guard<decltype(bucket.second)> lock(bucket.second);
@@ -413,8 +391,8 @@ namespace concurrencpp {
 				return static_cast<type*>(memory_pool::allocate(n * sizeof(type)));
 			}
 
-			void deallocate(type* const block, const size_t size) const noexcept {
-				memory_pool::deallocate(block, size * sizeof(type));
+			void deallocate(type* const block, const size_t count) const noexcept {
+				memory_pool::deallocate(block, count * sizeof(type));
 			}
 		};
 
@@ -1118,6 +1096,8 @@ namespace concurrencpp {
 
 		template<class result_type, class ... argument_types>
 		future<result_type> make_ready_future_impl(std::false_type, argument_types&& ... args) {
+			static_assert(std::is_constructible_v<result_type, argument_types...>,
+				"concurrencpp::make_ready_future<type>(args...) - cannot build type with given argument types.");
 			::concurrencpp::promise<result_type> promise;
 			promise.set_value(std::forward<argument_types>(args)...);
 			return promise.get_future();
@@ -1125,7 +1105,8 @@ namespace concurrencpp {
 
 		template<class result_type, class ... argument_types>
 		future<result_type> make_ready_future_impl(std::true_type, argument_types&& ... args) {
-			static_assert(sizeof...(args) == 0, "concurrencpp::make_ready_future<void> doesn't get any parameters");
+			static_assert(sizeof...(args) == 0,
+				"concurrencpp::make_ready_future<void>() shouldn't get any parameters.");
 			::concurrencpp::promise<result_type> promise;
 			promise.set_value();
 			return promise.get_future();
@@ -1193,10 +1174,8 @@ namespace concurrencpp {
 			bool valid() const noexcept { return !m_moved; }
 		};
 
-		template<class T>
-		auto& get_inner_state(T& state_holder) noexcept {
-			return state_holder.m_state;
-		}
+		template<class type>
+		auto& get_inner_state(type& state_holder) noexcept { return state_holder.m_state; }
 
 		template<class function_type>
 		class async_state : public callback_base, public pool_allocated {
@@ -1211,7 +1190,6 @@ namespace concurrencpp {
 			async_state(function_type&& function) : m_function(std::forward<function_type>(function)) {}
 
 			auto get_future() { return m_promise.get_future(); }
-
 			virtual void execute() override final { promise_setter::execute_set_promise(m_promise, m_function); }
 		};
 
@@ -1570,7 +1548,6 @@ namespace concurrencpp {
 				static timer_queue_container s_timer_queue_container;
 				return s_timer_queue_container;
 			}
-
 		};
 
 	}
@@ -1620,13 +1597,19 @@ namespace concurrencpp {
 		}
 
 		type get() {
+			static_assert(std::is_reference_v<type> ||
+				std::is_same_v<void,type> ||
+				std::is_move_constructible_v<type> ||
+				std::is_move_assignable_v<type>,
+				"concurrencpp::future<type>::get - type has to be void, reference type, move constructible or move assignable");
+			
 			throw_if_empty();
 			future _this(std::move(*this));
 			return _this.m_state->get();
 		}
 
 		template<class continuation_type, class ret_type = typename std::result_of_t<continuation_type(future<type>)>>	
-		future<ret_type> then(continuation_type&& continuation) {
+		future<ret_type> then(continuation_type&& continuation) {		
 			throw_if_empty();
 			auto this_state = m_state.get();
 			return this_state->set_then(std::move(*this), std::forward<continuation_type>(continuation));
@@ -1646,6 +1629,8 @@ namespace concurrencpp {
 	
 	template<class result_type, class exception_type, class ... argument_types>
 	future<result_type> make_exceptional_future(argument_types&& ... args) {
+		static_assert(std::is_constructible_v<exception_type, argument_types...>,
+			"concurrencpp::make_exceptional_future() - cannot build exception with given arguments.");
 		return make_exceptional_future<result_type>(
 			std::make_exception_ptr(exception_type(std::forward<argument_types>(args)...)));
 	}
@@ -1681,6 +1666,8 @@ namespace concurrencpp {
 
 		template<class ... argument_types>
 		void set_value(argument_types&& ... args) {
+			static_assert(std::is_constructible_v<type,argument_types...>,
+				"concurrencpp::promise<type>::set_value - cannot build type with given argument types.");
 			ensure_state();
 			m_state->set_result(std::forward<argument_types>(args)...);
 			m_fulfilled = true;
