@@ -578,8 +578,8 @@ namespace concurrencpp {
 
 		private:
 			std::vector<worker_thread> m_workers;
-			std::atomic_bool m_stop;
 			std::mutex m_pool_lock;
+			std::atomic_bool m_stop;
 
 			size_t choose_next_worker() noexcept {
 				static thread_local size_t counter = 0;
@@ -736,7 +736,7 @@ namespace concurrencpp {
 				m_function(std::forward<function_type>(function)) {}
 
 			void execute() noexcept final {
-				promise_setter::execute_set_promise(m_promise, [this] {
+				promise_setter::execute_set_promise(m_promise, [this] () -> decltype(auto){
 					return m_function(std::move(m_future));
 				});
 			}
@@ -861,13 +861,17 @@ namespace concurrencpp {
 
 				if (m_state == future_result_state::RESULT || m_state == future_result_state::EXCEPTION) {
 					::concurrencpp::promise<return_type> promise;
-					promise_setter::execute_set_promise(promise, [&function, &future] {return function(std::move(future)); });
+					auto setter = [&function, &future]() -> decltype(auto) {
+						return function(std::move(future)); 
+					};
+					
+					promise_setter::execute_set_promise(promise, setter);
 					return promise.get_future();
 				}
 				
 				if (m_state == future_result_state::DEFFERED) {
 					return ::concurrencpp::async(::concurrencpp::launch::deferred,
-						[future = std::move(future), function = std::forward<function_type>(function)]() mutable {
+						[future = std::move(future), function = std::forward<function_type>(function)]() mutable -> decltype(auto){
 							future.wait(); //will cause the future to be ready
 							return function(std::move(future));
 					});
@@ -1230,10 +1234,35 @@ namespace concurrencpp {
 		};
 
 		template<class type>
+		class unsafe_promise_base {
+			//A promise that never checks, never throws. used as a light-result/exception vehicle for coroutines.	
+		protected:
+			std::shared_ptr<details::future_associated_state<type>> m_state;
+
+		public:
+			unsafe_promise_base() { m_state = make_shared<future_associated_state<type>>(); }
+			auto get_future() const { return future<type>(m_state); }
+			void set_exception(std::exception_ptr e_ptr) { m_state->set_exception(std::move(e_ptr)); }
+		};
+
+		template<class type>
+		struct unsafe_promise : public unsafe_promise_base<type> {
+			template<class ... argument_types>
+			void set_value(argument_types&& ... args) {
+				m_state->set_result(std::forward<argument_types>(args)...);
+			}
+		};
+
+		template<>
+		struct unsafe_promise<void> : public unsafe_promise_base<void> {
+			void set_value() { m_state->set_result(); }
+		};
+
+		template<class type>
 		class promise_type_base {
 	
 		protected:
-			::concurrencpp::promise<type> m_promise;
+			unsafe_promise<type> m_promise;
 
 		public:		
 			bool initial_suspend() const noexcept { return false; }
@@ -1244,14 +1273,6 @@ namespace concurrencpp {
 
 		class timer_impl {
 
-		protected:
-			size_t m_next_fire_time;
-			std::atomic_size_t m_frequency;
-			const size_t m_due_time;
-			std::atomic_bool m_is_canceled;
-			bool m_has_due_time_reached;
-			const bool m_is_oneshot;
-
 		public:
 
 			enum class status {
@@ -1260,6 +1281,50 @@ namespace concurrencpp {
 				SCHEDULE_DELETE,
 				IDLE
 			};
+
+		private:
+
+			status update_timer_due_time(const size_t interval) noexcept {
+				assert(!m_has_due_time_reached);
+				if (m_next_fire_time <= interval) {
+					if (m_is_oneshot) {
+						return status::SCHEDULE_DELETE;
+					}
+
+					//repeating timer:
+					m_has_due_time_reached = true;
+					m_next_fire_time = m_frequency.load(std::memory_order_acquire);
+					return status::SCHEDULE;
+				}
+				else { //due time has not passed
+					m_next_fire_time -= interval;
+					return status::IDLE;
+				}
+			}
+
+			status update_timer_frequency(const size_t interval) noexcept {
+				assert(m_has_due_time_reached);
+				if (m_next_fire_time <= interval) {
+					m_next_fire_time = m_frequency.load(std::memory_order_acquire);
+					return status::SCHEDULE;
+				}
+				else {
+					m_next_fire_time -= interval;
+					return status::IDLE;
+				}
+			}
+
+		protected:
+			size_t m_next_fire_time;
+			std::atomic_size_t m_frequency;
+			const size_t m_due_time;
+			std::shared_ptr<timer_impl> m_next;
+			std::weak_ptr<timer_impl> m_prev;
+			std::atomic_bool m_is_canceled;
+			bool m_has_due_time_reached;
+			const bool m_is_oneshot;
+
+		public:
 
 			inline timer_impl(const size_t due_time, const size_t frequency, const bool is_oneshot) noexcept :
 				m_due_time(due_time),
@@ -1276,46 +1341,21 @@ namespace concurrencpp {
 					return status::DELETE_;
 				}
 
-				if (!m_has_due_time_reached) {
-					if (m_next_fire_time <= interval) {
-						if (m_is_oneshot) {
-							return status::SCHEDULE_DELETE;
-						}
-
-						//repeating timer:
-						m_has_due_time_reached = true;
-						m_next_fire_time = m_frequency.load(std::memory_order_acquire);
-						return status::SCHEDULE;
-					}
-					else { //due time has not passed
-						m_next_fire_time -= interval;
-						return status::IDLE;
-					}
-
-				}
-				else {	//frequency:
-					if (m_next_fire_time <= interval) {
-						m_next_fire_time = m_frequency.load(std::memory_order_acquire);
-						return status::SCHEDULE;
-					}
-					else {
-						m_next_fire_time -= interval;
-						return status::IDLE;
-					}
+				if (m_has_due_time_reached) {
+					return update_timer_frequency(interval);
 				}
 
-				return status::IDLE;
+				return update_timer_due_time(interval);
 			}
 
-			inline void cancel() noexcept {
-				m_is_canceled.store(true, std::memory_order_release);
-			}
+			inline void cancel() noexcept { m_is_canceled.store(true, std::memory_order_release); }
+			inline const size_t next_fire_time() const noexcept { return m_next_fire_time; }	
+			inline void set_next(decltype(m_next) next) noexcept { m_next = std::move(next); }
+			inline void set_prev(decltype(m_prev) prev) noexcept { m_prev = std::move(prev); }
+			inline decltype(m_next) get_next() const noexcept { return m_next; }
+			inline decltype(m_prev) get_prev() const noexcept { return m_prev; }
 
-			inline const size_t next_fire_time() const noexcept {
-				return m_next_fire_time;
-			}
-
-			inline void set_new_frequency_time(size_t new_frequency) noexcept {
+			inline void set_new_frequency_time(size_t new_frequency) noexcept { 
 				m_frequency.store(new_frequency, std::memory_order_release);
 			}
 
@@ -1340,14 +1380,14 @@ namespace concurrencpp {
 
 		};
 
+		//type erased
 		template<class task_type>
 		std::shared_ptr<timer_impl> make_timer_impl(
 			const size_t due_time,
 			const size_t frequency,
 			const bool is_oneshot,
 			task_type&& task) {
-
-			pool_allocator<concrete_timer<task_type>> allocator;
+			pool_allocator<char> allocator;
 			return std::allocate_shared<concrete_timer<task_type>>(
 				allocator,
 				due_time,
@@ -1363,7 +1403,6 @@ namespace concurrencpp {
 			const bool is_oneshot,
 			function_type&& function,
 			argument_types&& ... args) {
-
 			return make_timer_impl(
 				due_time,
 				frequency,
@@ -1376,61 +1415,84 @@ namespace concurrencpp {
 			using timer_ptr = std::shared_ptr<timer_impl>;
 
 		private:
-			std::vector<timer_ptr> m_running_timers, m_queued_timers;
-			std::mutex m_lock;
+			timer_ptr m_running_timers, m_queued_timers;
+			std::mutex m_running_timers_lock, m_queued_times_lock;
 			std::condition_variable m_condition;
 			std::chrono::system_clock::time_point m_last_time_point;
 			thread_pool& m_thread_pool;
 			bool m_is_running;
 
-			inline void remove_timer(size_t index) {
-				assert(index < m_running_timers.size());
-				std::swap(m_running_timers.back(), m_running_timers[index]);
-				m_running_timers.pop_back();
-			}
-
 			inline size_t add_queued_timers() {
-				std::lock_guard<decltype(m_lock)> lock(m_lock);
+				std::lock_guard<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
 
-				if (m_queued_timers.empty()) {
+				if (!static_cast<bool>(m_queued_timers)) {
 					return std::numeric_limits<size_t>::max();
 				}
 
-				auto comparator = [](const timer_ptr& timer_1, const timer_ptr& timer_2) {
-					return timer_1->next_fire_time() < timer_2->next_fire_time();
-				};
+				size_t min_fire_time = std::numeric_limits<size_t>::max();
+				auto cursor = m_queued_timers;
 
-				const auto min_time = (**std::min_element(
-					m_queued_timers.begin(),
-					m_queued_timers.end(),
-					comparator)).next_fire_time();
+				while (true) {
+					const auto next_fire_time = cursor->next_fire_time();
+					if (next_fire_time < min_fire_time) {
+						min_fire_time = next_fire_time;
+					}
+					
+					auto next = cursor->get_next();
+					if (!static_cast<bool>(next)) {
+						break;
+					}
+					
+					cursor = std::move(next);
+				}
 
-				m_running_timers.insert(
-					m_running_timers.end(),
-					std::make_move_iterator(m_queued_timers.begin()),
-					std::make_move_iterator(m_queued_timers.end()));
+				//cursor now points to the last node in the linked list, to which we'll append
+				//the timers which are already running
+				assert(static_cast<bool>(cursor));		
+				auto running_timers = std::move(m_running_timers);
+				m_running_timers = std::move(m_queued_timers);
+				cursor->set_next(running_timers);
+				
+				if (static_cast<bool>(running_timers)) {
+					running_timers->set_prev(cursor);
+				}
 
-				m_queued_timers.clear();
-				return min_time;
+				return min_fire_time;
+			}
+
+			inline void remove_timer(timer_ptr timer) noexcept {
+				auto prev = timer->get_prev().lock();
+				auto next = timer->get_next();
+				if (next) {
+					next->set_prev(prev);
+				}
+
+				if (prev) {
+					prev->set_next(next);
+				}
+
+				if (m_running_timers.get() == timer.get()) {
+					m_running_timers = next;
+				}
 			}
 
 			inline size_t process_running_timers() {
-				if (m_running_timers.empty()) {
+				std::unique_lock<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
+
+				if (!static_cast<bool>(m_running_timers)) {
 					return std::numeric_limits<size_t>::max();
 				}
 
-				auto minimum_fire_time = m_running_timers[0]->next_fire_time();
+				auto cursor = m_running_timers;
+				auto minimum_fire_time = std::numeric_limits<size_t>::max();
 				auto callback = [](timer_ptr timer) { timer->execute(); };
-
-				for (size_t i = 0; i < m_running_timers.size(); i++) {
-					auto& timer = m_running_timers[i];
-					const auto chrono_interval =
-						std::chrono::system_clock::now().time_since_epoch() -
-						m_last_time_point.time_since_epoch();
-
+	
+				while(static_cast<bool>(cursor)) {
+					auto& timer = *cursor;
+					const auto chrono_interval = std::chrono::system_clock::now() - m_last_time_point;
 					const auto interval = std::chrono::duration_cast<std::chrono::milliseconds>(chrono_interval).count();
-					const auto status = timer->update(static_cast<size_t>(interval));
-					const auto next_fire_time = timer->next_fire_time();
+					const auto status = timer.update(static_cast<size_t>(interval));
+					const auto next_fire_time = timer.next_fire_time();
 					if (next_fire_time < minimum_fire_time) {
 						minimum_fire_time = next_fire_time;
 					}
@@ -1438,28 +1500,25 @@ namespace concurrencpp {
 					switch (status) {
 
 					case timer_impl::status::SCHEDULE: {
-						m_thread_pool.enqueue_task(callback, timer);
+						m_thread_pool.enqueue_task(callback, cursor);
 						break;
 					}
 
 					case timer_impl::status::SCHEDULE_DELETE: {
-						m_thread_pool.enqueue_task(callback, std::move(timer));
-						remove_timer(i);
-						--i;
+						m_thread_pool.enqueue_task(callback, cursor);
+						remove_timer(cursor);
 						break;
 					}
 
 					case timer_impl::status::DELETE_: {
-						remove_timer(i);
-						--i;
+						remove_timer(cursor);
 						break;
 					}
+	
+					}	//end of switch
 
-					//end of switch
-					}
-
-					//end of for loop
-				}
+					cursor = cursor->get_next();	
+				}	//end of for loop
 
 				m_last_time_point = std::chrono::system_clock::now();
 				return minimum_fire_time;
@@ -1474,8 +1533,16 @@ namespace concurrencpp {
 
 			void add_timer(timer_ptr timer) {
 				{
-					std::lock_guard<decltype(m_lock)> lock(m_lock);
-					m_queued_timers.emplace_back(std::move(timer));
+					std::lock_guard<decltype(m_running_timers_lock)> lock(m_running_timers_lock);	
+					if (!static_cast<bool>(m_queued_timers)) {
+						m_queued_timers = std::move(timer);
+					}
+					else {
+						auto timers = std::move(m_queued_timers);
+						m_queued_timers = std::move(timer);
+						timers->set_prev(timers);
+						m_queued_timers->set_next(timers);
+					}	
 				}
 
 				m_condition.notify_one();
@@ -1489,7 +1556,7 @@ namespace concurrencpp {
 					}
 
 					//if there are no queued timers, then go back to sleep.
-					return !m_queued_timers.empty();
+					return static_cast<bool>(m_queued_timers);
 				};
 
 				while (true) {
@@ -1501,7 +1568,7 @@ namespace concurrencpp {
 						size_t(1000) * 60 * 60 * 24 * 30 * 100 :
 						next_fire_time;
 
-					std::unique_lock<decltype(m_lock)> lock(m_lock);
+					std::unique_lock<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
 					m_condition.wait_for(lock, std::chrono::milliseconds(next_fire_time), pred);
 		
 					if (!m_is_running) {
@@ -1512,13 +1579,12 @@ namespace concurrencpp {
 
 			void stop() {
 				{
-					std::lock_guard<decltype(m_lock)> lock(m_lock);
+					std::lock_guard<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
 					m_is_running = false;
 				}
 
 				m_condition.notify_one();
 			}
-
 		};
 
 		class timer_queue_container {
@@ -1549,7 +1615,6 @@ namespace concurrencpp {
 				return s_timer_queue_container;
 			}
 		};
-
 	}
 
 	template<class type>
@@ -1572,7 +1637,7 @@ namespace concurrencpp {
 
 		future() noexcept = default;
 		future(future&& rhs) noexcept = default;
-		future& operator = (future&& rhds) noexcept = default;
+		future& operator = (future&& rhs) noexcept = default;
 
 		future(const future& rhs) = delete;
 		future& operator = (const future&) = delete;
@@ -1892,7 +1957,7 @@ namespace concurrencpp {
 			void set_future(::concurrencpp::future<type>& future) noexcept {
 				assert(future.valid());
 				std::get<index>(m_futures) = 
-					future.then([_this = shared_from_this()](::concurrencpp::future<type> future) mutable {
+					future.then([_this = shared_from_this()](::concurrencpp::future<type> future) mutable ->type {
 					return _this->on_task_finished(std::move(future), index);
 				});
 			}
@@ -1932,6 +1997,13 @@ namespace concurrencpp {
 }
 
 namespace concurrencpp {
+
+	struct empty_timer : public std::runtime_error {
+
+		template<class ... arguments>
+		empty_timer(arguments&& ... args) : std::runtime_error(std::forward<arguments>(args)...) {}
+
+	};
 
 	class timer {
 
@@ -1998,13 +2070,6 @@ namespace concurrencpp {
 		}
 
 		bool valid() const noexcept { return static_cast<bool>(m_impl); }
-
-		struct empty_timer : public std::runtime_error {
-
-			template<class ... arguments>
-			empty_timer(arguments&& ... args) : std::runtime_error(std::forward<arguments>(args)...) {}
-
-		};
 
 		template<class function_type, class ... arguments_type>
 		static void once(size_t due_time, function_type&& function, arguments_type&& ... args) {
