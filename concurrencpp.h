@@ -89,11 +89,11 @@ namespace concurrencpp {
 			spinlock() noexcept : m_lock(unlocked) {}
 
 			void lock() {
-				if (try_lock_once([] { pause_cpu(); })) {
+				if (try_lock_once(pause_cpu)) {
 					return;
 				}
 
-				if (try_lock_once([] { std::this_thread::yield(); })) {
+				if (try_lock_once(std::this_thread::yield)) {
 					return;
 				}
 
@@ -117,6 +117,7 @@ namespace concurrencpp {
 		class recursive_spinlock {
 
 		private:
+			spinlock m_lock;
 			std::atomic<std::thread::id> m_owner;
 			intmax_t m_count;
 
@@ -127,18 +128,14 @@ namespace concurrencpp {
 			void lock() noexcept {
 				const auto this_thread = std::this_thread::get_id();
 				std::thread::id no_id;
-				if (m_owner != this_thread) {
-					while (!m_owner.compare_exchange_weak(
-						no_id,
-						this_thread,
-						std::memory_order_acquire,
-						std::memory_order_relaxed)) {
-						no_id = {};
-						std::this_thread::yield();
-					}
+				if (m_owner.load(std::memory_order_acquire) == this_thread) {
+					++m_count;
+					return;
 				}
 
-				m_count++;
+				m_lock.lock();
+				m_owner.store(this_thread, std::memory_order_release);
+				m_count = 1;
 			}
 
 			void unlock() noexcept {
@@ -146,9 +143,12 @@ namespace concurrencpp {
 				assert(m_count > 0);
 
 				--m_count;
-				if (m_count == 0) {
-					m_owner.store(std::thread::id(), std::memory_order_release);
+				if (m_count != 0) {
+					return;
 				}
+
+				m_owner.store(std::thread::id(), std::memory_order_release);
+				m_lock.unlock();
 			}
 
 		};
@@ -884,18 +884,24 @@ namespace concurrencpp {
 			}
 
 			void set_coro_handle(decltype(m_coro_handle) coro_handle) noexcept {
-				std::unique_lock<decltype(m_lock)> lock(m_lock);
-				
-				assert(!static_cast<bool>(m_deffered));
-				assert(!static_cast<bool>(m_coro_handle));
-				assert(!static_cast<bool>(m_then));
-				
+				future_result_state state;
+
+				{
+					std::unique_lock<decltype(m_lock)> lock(m_lock);
+
+					assert(!static_cast<bool>(m_deffered));
+					assert(!static_cast<bool>(m_coro_handle));
+					assert(!static_cast<bool>(m_then));
+
+					state = m_state;
+					m_coro_handle = coro_handle;
+				}	
+
 				//It could be that in between the time of await_ready() and await_suspend() the result was set. recheck
-				if (m_state == future_result_state::RESULT || m_state == future_result_state::EXCEPTION) {
-					return coro_handle();
-				}
-				
-				m_coro_handle = coro_handle;
+				if (state == future_result_state::RESULT || state == future_result_state::EXCEPTION) {
+					 m_coro_handle();
+					 return;
+				}		
 			}
 
 			void set_exception(std::exception_ptr exception_pointer, void* exception_storage) {
@@ -1265,8 +1271,8 @@ namespace concurrencpp {
 			unsafe_promise<type> m_promise;
 
 		public:		
-			bool initial_suspend() const noexcept { return false; }
-			bool final_suspend() const noexcept { return false; }
+			auto initial_suspend() const noexcept { return std::experimental::suspend_never(); }
+			auto final_suspend() const noexcept { return std::experimental::suspend_never(); }
 			::concurrencpp::future<type> get_return_object() { return m_promise.get_future(); }
 			void set_exception(std::exception_ptr exception) { m_promise.set_exception(exception); }
 		};
@@ -1415,75 +1421,38 @@ namespace concurrencpp {
 			using timer_ptr = std::shared_ptr<timer_impl>;
 
 		private:
-			timer_ptr m_running_timers, m_queued_timers;
-			std::mutex m_running_timers_lock, m_queued_times_lock;
+			timer_ptr m_timers;
+			std::mutex m_lock;
 			std::condition_variable m_condition;
 			std::chrono::system_clock::time_point m_last_time_point;
 			thread_pool& m_thread_pool;
 			bool m_is_running;
 
-			inline size_t add_queued_timers() {
-				std::lock_guard<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
-
-				if (!static_cast<bool>(m_queued_timers)) {
-					return std::numeric_limits<size_t>::max();
-				}
-
-				size_t min_fire_time = std::numeric_limits<size_t>::max();
-				auto cursor = m_queued_timers;
-
-				while (true) {
-					const auto next_fire_time = cursor->next_fire_time();
-					if (next_fire_time < min_fire_time) {
-						min_fire_time = next_fire_time;
-					}
-					
-					auto next = cursor->get_next();
-					if (!static_cast<bool>(next)) {
-						break;
-					}
-					
-					cursor = std::move(next);
-				}
-
-				//cursor now points to the last node in the linked list, to which we'll append
-				//the timers which are already running
-				assert(static_cast<bool>(cursor));		
-				auto running_timers = std::move(m_running_timers);
-				m_running_timers = std::move(m_queued_timers);
-				cursor->set_next(running_timers);
-				
-				if (static_cast<bool>(running_timers)) {
-					running_timers->set_prev(cursor);
-				}
-
-				return min_fire_time;
-			}
-
 			inline void remove_timer(timer_ptr timer) noexcept {
 				auto prev = timer->get_prev().lock();
 				auto next = timer->get_next();
-				if (next) {
+
+				if (static_cast<bool>(next)) {
 					next->set_prev(prev);
 				}
 
-				if (prev) {
+				if (static_cast<bool>(prev)) {
 					prev->set_next(next);
 				}
 
-				if (m_running_timers.get() == timer.get()) {
-					m_running_timers = next;
+				if (m_timers.get() == timer.get()) {
+					m_timers = next;
 				}
 			}
 
-			inline size_t process_running_timers() {
-				std::unique_lock<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
+			inline size_t process_timers() {
+				std::unique_lock<decltype(m_lock)> lock(m_lock);
 
-				if (!static_cast<bool>(m_running_timers)) {
+				if (!static_cast<bool>(m_timers)) {
 					return std::numeric_limits<size_t>::max();
 				}
 
-				auto cursor = m_running_timers;
+				auto cursor = m_timers;
 				auto minimum_fire_time = std::numeric_limits<size_t>::max();
 				auto callback = [](timer_ptr timer) { timer->execute(); };
 	
@@ -1533,15 +1502,15 @@ namespace concurrencpp {
 
 			void add_timer(timer_ptr timer) {
 				{
-					std::lock_guard<decltype(m_running_timers_lock)> lock(m_running_timers_lock);	
-					if (!static_cast<bool>(m_queued_timers)) {
-						m_queued_timers = std::move(timer);
+					std::lock_guard<decltype(m_lock)> lock(m_lock);	
+					if (!static_cast<bool>(m_timers)) {
+						m_timers = std::move(timer);
 					}
 					else {
-						auto timers = std::move(m_queued_timers);
-						m_queued_timers = std::move(timer);
+						auto timers = std::move(m_timers);
+						m_timers = std::move(timer);
 						timers->set_prev(timers);
-						m_queued_timers->set_next(timers);
+						m_timers->set_next(timers);
 					}	
 				}
 
@@ -1549,27 +1518,16 @@ namespace concurrencpp {
 			}
 
 			void work_loop() {
-				//predicate which returns ​false if the waiting should be continued. 
-				auto pred = [this] {
-					if (!m_is_running) {
-						return true; //break the work loop
-					}
-
-					//if there are no queued timers, then go back to sleep.
-					return static_cast<bool>(m_queued_timers);
-				};
-
 				while (true) {
-					auto next_fire_time = process_running_timers();
-					next_fire_time = std::min(next_fire_time, add_queued_timers());
+					auto next_fire_time = process_timers();
 
 					next_fire_time =
 						(next_fire_time == std::numeric_limits<size_t>::max()) ?
 						size_t(1000) * 60 * 60 * 24 * 30 * 100 :
 						next_fire_time;
 
-					std::unique_lock<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
-					m_condition.wait_for(lock, std::chrono::milliseconds(next_fire_time), pred);
+					std::unique_lock<decltype(m_lock)> lock(m_lock);
+					m_condition.wait_for(lock, std::chrono::milliseconds(next_fire_time));
 		
 					if (!m_is_running) {
 						return;
@@ -1579,7 +1537,7 @@ namespace concurrencpp {
 
 			void stop() {
 				{
-					std::lock_guard<decltype(m_running_timers_lock)> lock(m_running_timers_lock);
+					std::lock_guard<decltype(m_lock)> lock(m_lock);
 					m_is_running = false;
 				}
 
@@ -2085,7 +2043,7 @@ namespace concurrencpp {
 
 		template<class ignored_type = void>
 		static future<void> delay(size_t due_time) {
-			::concurrencpp::promise<void> promise;
+			::concurrencpp::details::unsafe_promise<void> promise;
 			auto future = promise.get_future();
 			once(due_time, [promise = std::move(promise)]() mutable {
 				promise.set_value();
@@ -2094,7 +2052,6 @@ namespace concurrencpp {
 			return future;
 		}
 	};
-
 }
 
 namespace std {
@@ -2126,8 +2083,8 @@ namespace std {
 			struct promise_type : public concurrencpp::details::pool_allocated {
 				promise_type() noexcept {}
 				void get_return_object() noexcept {}
-				bool initial_suspend() const noexcept { return false; }
-				bool final_suspend() const noexcept { return false; }
+				auto initial_suspend() const noexcept { return suspend_never{}; }
+				auto final_suspend() const noexcept { return suspend_never{}; }
 				void return_void() noexcept {}
 
 				template<class exception_type>
