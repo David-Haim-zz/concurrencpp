@@ -413,6 +413,9 @@ namespace concurrencpp {
 
 	namespace details {
 
+		template<class type> class future_associated_state;
+		template<class type> struct unsafe_promise;
+
 		struct callback_base {
 			virtual ~callback_base() = default;
 			virtual void execute() = 0;
@@ -671,22 +674,21 @@ namespace concurrencpp {
 		};
 
 		struct promise_setter {
-
-			template<class function_type, class type>
-			static void execute_set_promise(::concurrencpp::promise<type>& promise, function_type&& function) noexcept {
-				try {
-					promise.set_value(function());
-				}
-				catch (...) {
-					promise.set_exception(std::current_exception());
-				}
+			template<class type, class function_type>
+			static void execute_impl(promise<type>& promise, function_type&& function) {
+				promise.set_value(function());
 			}
 
 			template<class function_type>
-			static void execute_set_promise(::concurrencpp::promise<void>& promise, function_type&& function) noexcept {
+			static void execute_impl(promise<void>& promise, function_type&& function){
+				function();
+				promise.set_value();
+			}
+
+			template<class type, class function_type>
+			static void execute_set_promise(promise<type>& promise, function_type&& function) noexcept {
 				try {
-					function();
-					promise.set_value();
+					execute_impl(promise, function);
 				}
 				catch (...) {
 					promise.set_exception(std::current_exception());
@@ -726,7 +728,7 @@ namespace concurrencpp {
 
 		private:
 			::concurrencpp::future<type> m_future;
-			::concurrencpp::promise<new_type> m_promise;
+			unsafe_promise<new_type> m_promise;
 			function_type m_function;
 
 		public:
@@ -736,7 +738,7 @@ namespace concurrencpp {
 				m_function(std::forward<function_type>(function)) {}
 
 			void execute() noexcept final {
-				promise_setter::execute_set_promise(m_promise, [this] () -> decltype(auto){
+				m_promise.set_from_function([this] () -> decltype(auto){
 					return m_function(std::move(m_future));
 				});
 			}
@@ -860,12 +862,12 @@ namespace concurrencpp {
 				assert(!static_cast<bool>(m_then));
 
 				if (m_state == future_result_state::RESULT || m_state == future_result_state::EXCEPTION) {
-					::concurrencpp::promise<return_type> promise;
-					auto setter = [&function, &future]() -> decltype(auto) {
+					unsafe_promise<return_type> promise;
+					auto setter = [&]() -> decltype(auto) {
 						return function(std::move(future)); 
 					};
 					
-					promise_setter::execute_set_promise(promise, setter);
+					promise.set_from_function(setter);
 					return promise.get_future();
 				}
 				
@@ -1108,7 +1110,7 @@ namespace concurrencpp {
 		future<result_type> make_ready_future_impl(std::false_type, argument_types&& ... args) {
 			static_assert(std::is_constructible_v<result_type, argument_types...>,
 				"concurrencpp::make_ready_future<type>(args...) - cannot build type with given argument types.");
-			::concurrencpp::promise<result_type> promise;
+			unsafe_promise<result_type> promise;
 			promise.set_value(std::forward<argument_types>(args)...);
 			return promise.get_future();
 		}
@@ -1117,15 +1119,16 @@ namespace concurrencpp {
 		future<result_type> make_ready_future_impl(std::true_type, argument_types&& ... args) {
 			static_assert(sizeof...(args) == 0,
 				"concurrencpp::make_ready_future<void>() shouldn't get any parameters.");
-			::concurrencpp::promise<result_type> promise;
+			unsafe_promise<result_type> promise;
 			promise.set_value();
 			return promise.get_future();
 		}
+
 		template<class type>
 		class promise_base {
 
 		protected:
-			std::shared_ptr<details::future_associated_state<type>> m_state;
+			std::shared_ptr<future_associated_state<type>> m_state;
 			bool m_future_retreived, m_fulfilled, m_moved;
 
 			promise_base() noexcept : m_fulfilled(false), m_future_retreived(false), m_moved(false) {}
@@ -1193,14 +1196,14 @@ namespace concurrencpp {
 			using return_type = typename std::result_of_t<function_type()>;
 
 		private:
-			::concurrencpp::promise<return_type> m_promise;
+			unsafe_promise<return_type> m_promise;
 			function_type m_function;
 
 		public:
 			async_state(function_type&& function) : m_function(std::forward<function_type>(function)) {}
 
 			auto get_future() { return m_promise.get_future(); }
-			virtual void execute() override final { promise_setter::execute_set_promise(m_promise, m_function); }
+			virtual void execute() override final { m_promise.set_from_function(m_function); }
 		};
 
 		template<class scheduler_type, class function_type>
@@ -1217,6 +1220,14 @@ namespace concurrencpp {
 			template<class type>
 			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<type>* state) {
 				auto& thread_pool = ::concurrencpp::details::thread_pool::default_instance();
+				thread_pool.enqueue_task(std::move(task));
+			}
+		};
+
+		struct io_thread_pool_scheduler {
+			template<class type>
+			static void schedule(std::unique_ptr<callback_base> task, future_associated_state<type>* state) {
+				auto& thread_pool = ::concurrencpp::details::thread_pool::blocking_tasks_instance();
 				thread_pool.enqueue_task(std::move(task));
 			}
 		};
@@ -1241,27 +1252,49 @@ namespace concurrencpp {
 
 		template<class type>
 		class unsafe_promise_base {
-			//A promise that never checks, never throws. used as a light-result/exception vehicle for coroutines.	
+			//A promise that never checks, never throws. used as a light-result/exception vehicle for coroutines/library functions.	
 		protected:
-			std::shared_ptr<details::future_associated_state<type>> m_state;
+			std::shared_ptr<future_associated_state<type>> m_state;
 
 		public:
 			unsafe_promise_base() { m_state = make_shared<future_associated_state<type>>(); }
 			auto get_future() const { return future<type>(m_state); }
 			void set_exception(std::exception_ptr e_ptr) { m_state->set_exception(std::move(e_ptr)); }
+			future_associated_state<type>* get_associated_state() noexcept { return m_state.get(); }	
 		};
 
 		template<class type>
 		struct unsafe_promise : public unsafe_promise_base<type> {
 			template<class ... argument_types>
 			void set_value(argument_types&& ... args) {
-				m_state->set_result(std::forward<argument_types>(args)...);
+				this->m_state->set_result(std::forward<argument_types>(args)...);
+			}
+
+			template<class function_type>
+			void set_from_function(function_type&& function) {
+				try {
+					this->m_state->set_result(function());
+				}
+				catch (...) {
+					this->m_state->set_exception(std::current_exception());
+				}
 			}
 		};
 
 		template<>
 		struct unsafe_promise<void> : public unsafe_promise_base<void> {
 			void set_value() { m_state->set_result(); }
+		
+			template<class function_type>
+			void set_from_function(function_type&& function) {
+				try {
+					function();
+					m_state->set_result();
+				}
+				catch (...) {
+					m_state->set_exception(std::current_exception());
+				}
+			}
 		};
 
 		template<class type>
@@ -1660,7 +1693,7 @@ namespace concurrencpp {
 
 	template<class result_type>
 	future<result_type> make_exceptional_future(std::exception_ptr exception_pointer) {
-		promise<result_type> promise;
+		details::unsafe_promise<result_type> promise;
 		promise.set_exception(exception_pointer);
 		return promise.get_future();
 	}
@@ -1671,17 +1704,17 @@ namespace concurrencpp {
 		promise() noexcept = default;
 		
 		promise(promise&& rhs) noexcept {
-			m_state = std::move(rhs.m_state);
+			this->m_state = std::move(rhs.m_state);
 			rhs.m_moved = true;
 		}
 		
 		promise& operator = (promise&& rhs) noexcept {
-			break_promise_if_needed();
+			this->break_promise_if_needed();
 			
-			m_state = std::move(rhs.m_state);
-			m_moved = rhs.m_moved;
-			m_fulfilled = rhs.m_fulfilled;
-			m_future_retreived = rhs.m_future_retreived;
+			this->m_state = std::move(rhs.m_state);
+			this->m_moved = rhs.m_moved;
+			this->m_fulfilled = rhs.m_fulfilled;
+			this->m_future_retreived = rhs.m_future_retreived;
 			
 			rhs.m_moved = true;
 			return *this;
@@ -1691,9 +1724,9 @@ namespace concurrencpp {
 		void set_value(argument_types&& ... args) {
 			static_assert(std::is_constructible_v<type,argument_types...>,
 				"concurrencpp::promise<type>::set_value - cannot build type with given argument types.");
-			ensure_state();
-			m_state->set_result(std::forward<argument_types>(args)...);
-			m_fulfilled = true;
+			this->ensure_state();
+			this->m_state->set_result(std::forward<argument_types>(args)...);
+			this->m_fulfilled = true;
 		}
 
 		void swap(promise& rhs) noexcept {
@@ -1710,24 +1743,24 @@ namespace concurrencpp {
 		promise() noexcept = default;
 
 		promise(promise&& rhs) noexcept {
-			m_state = std::move(rhs.m_state);
+			this->m_state = std::move(rhs.m_state);
 			rhs.m_moved = true;
 		}
 
 		promise& operator = (promise&& rhs) noexcept {
-			break_promise_if_needed();
-			m_state = std::move(rhs.m_state);
-			m_moved = rhs.m_moved;
-			m_fulfilled = rhs.m_fulfilled;
-			m_future_retreived = rhs.m_future_retreived;
+			this->break_promise_if_needed();
+			this->m_state = std::move(rhs.m_state);
+			this->m_moved = rhs.m_moved;
+			this->m_fulfilled = rhs.m_fulfilled;
+			this->m_future_retreived = rhs.m_future_retreived;
 			rhs.m_moved = true;
 			return *this;
 		}
 
 		void set_value() {
-			ensure_state();
-			m_state->set_result();
-			m_fulfilled = true;
+			this->ensure_state();
+			this->m_state->set_result();
+			this->m_fulfilled = true;
 		}
 	};
 
@@ -1746,7 +1779,8 @@ namespace concurrencpp {
 	enum class launch {
 		async,
 		deferred,
-		task
+		task,
+		blocked_task
 	};
 
 	template <class F, class... Args>
@@ -1783,6 +1817,10 @@ namespace concurrencpp {
 
 		case ::concurrencpp::launch::task: {
 			return details::async_impl<details::thread_pool_scheduler>(
+				std::forward<function_type>(function));
+		}
+		case ::concurrencpp::launch::blocked_task: {
+			return details::async_impl<details::io_thread_pool_scheduler>(
 				std::forward<function_type>(function));
 		}
 		case ::concurrencpp::launch::async: {
@@ -1824,7 +1862,7 @@ namespace concurrencpp {
 		private:
 			std::tuple<future_types...> m_tuple;
 			std::atomic_size_t m_counter;
-			::concurrencpp::promise<decltype(m_tuple)> m_promise;
+			unsafe_promise<decltype(m_tuple)> m_promise;
 
 			template<class type, size_t index>
 			void on_future_ready(::concurrencpp::future<type> done_future) {
@@ -1838,7 +1876,7 @@ namespace concurrencpp {
 
 			template<size_t index, class type, class ... future_types>
 			void set_future_then(::concurrencpp::future<type>& future, future_types&& ... futures) {
-				future.then([_this = shared_from_this()](::concurrencpp::future<type> done_future){
+				future.then([_this = this->shared_from_this()](::concurrencpp::future<type> done_future){
 					_this->on_future_ready<type, index>(std::move(done_future));
 				});
 
@@ -1893,9 +1931,9 @@ namespace concurrencpp {
 		class when_any_state : public std::enable_shared_from_this<when_any_state<sequence_type>>{
 			
 		private:
-			::std::atomic_bool m_fulfilled;
-			::concurrencpp::promise<::concurrencpp::when_any_result<sequence_type>> m_promise;
+			unsafe_promise<::concurrencpp::when_any_result<sequence_type>> m_promise;
 			sequence_type m_futures;
+			::std::atomic_bool m_fulfilled;
 
 			template<class type>
 			type on_task_finished(::concurrencpp::future<type> future, size_t index) {
@@ -1915,7 +1953,7 @@ namespace concurrencpp {
 			void set_future(::concurrencpp::future<type>& future) noexcept {
 				assert(future.valid());
 				std::get<index>(m_futures) = 
-					future.then([_this = shared_from_this()](::concurrencpp::future<type> future) mutable ->type {
+					future.then([_this = this->shared_from_this()](::concurrencpp::future<type> future) mutable ->type {
 					return _this->on_task_finished(std::move(future), index);
 				});
 			}
@@ -2043,7 +2081,7 @@ namespace concurrencpp {
 
 		template<class ignored_type = void>
 		static future<void> delay(size_t due_time) {
-			::concurrencpp::details::unsafe_promise<void> promise;
+			details::unsafe_promise<void> promise;
 			auto future = promise.get_future();
 			once(due_time, [promise = std::move(promise)]() mutable {
 				promise.set_value();
