@@ -1783,38 +1783,40 @@ namespace concurrencpp {
 		blocked_task
 	};
 
-	template <class F, class... Args>
-	auto async(launch launch_policy, F&& f, Args&&... args) {
+	template <class function_type, class... argument_types>
+	auto async(launch launch_policy, function_type&& function, argument_types&&... args) {
 		using function_type = typename std::decay_t<F>;
 		using result = typename std::result_of_t<function_type(Args...)>;
 
 		switch (launch_policy) {
-
 		case launch::task: {
-			return details::async_impl<result, details::thread_pool_scheduler>::do_async(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+			return details::async_impl<result, details::thread_pool_scheduler>::do_async(
+				std::bind(std::forward<function_type>(function), std::forward<argument_types>(args)...));
 		}
-
+		case launch::blocked_task: {
+			return details::async_impl<result, details::io_thread_pool_scheduler>::do_async(
+				std::bind(std::forward<function_type>(function), std::forward<argument_types>(args)...));
+		}
 		case launch::deferred: {
-			return details::async_impl<result, details::deffered_schedueler>::do_async(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+			return details::async_impl<result, details::deffered_schedueler>::do_async(
+				std::bind(std::forward<function_type>(function), std::forward<argument_types>(args)...));
 		}
-
 		case launch::async: {
-			return details::async_impl<result, details::thread_scheduler>::do_async(std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+			return details::async_impl<result, details::thread_scheduler>::do_async(
+				std::bind(std::forward<function_type>(function), std::forward<argument_types>(args)...));
 		}
-
 		}
 
 		assert(false);
 		return decltype(details::async_impl<
 			result, details::thread_pool_scheduler>::do_async(
-				std::bind(std::forward<F>(f), std::forward<Args>(args)...))){};
+				std::bind(std::forward<F>(function), std::forward<Args>(args)...))){};
 	}
 
 	template <class function_type>
 	auto async(launch launch_policy, function_type&& function) {
 	
 		switch (launch_policy) {
-
 		case ::concurrencpp::launch::task: {
 			return details::async_impl<details::thread_pool_scheduler>(
 				std::forward<function_type>(function));
@@ -1827,12 +1829,10 @@ namespace concurrencpp {
 			return details::async_impl<details::thread_scheduler>(
 				std::forward<function_type>(function));
 		}
-
 		case ::concurrencpp::launch::deferred: {
 			return details::async_impl<details::deffered_schedueler>(
 				std::forward<function_type>(function));
 		}
-
 		}
 
 		assert(false);
