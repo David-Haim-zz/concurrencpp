@@ -43,12 +43,9 @@ namespace concurrencpp {
 	namespace details {
 
 		class spinlock {
-			constexpr static size_t locked = 1;
-			constexpr static size_t unlocked = 0;
-			constexpr static size_t spin_count = 128;
 
 		private:
-			std::atomic_size_t m_lock;
+			std::atomic_flag locked = ATOMIC_FLAG_INIT;
 
 			static void pause_cpu() noexcept {
 #if (COMPILER == MVCC)
@@ -63,30 +60,19 @@ namespace concurrencpp {
 				size_t counter = 0ul;
 
 				//make the processor yield
-				while (true) {
-					const auto state = std::atomic_exchange_explicit(
-						&m_lock,
-						locked,
-						std::memory_order_acquire);
-
-					if (state == unlocked) {
-						return true;
-					}
-
-					if (counter == spin_count) {
-						break;
+				while (locked.test_and_set(std::memory_order_acquire)) {
+					if (counter == 128) {
+						return false;
 					}
 
 					++counter;
 					on_fail_callable();
 				}
 
-				return false;
+				return true;
 			}
 
 		public:
-
-			spinlock() noexcept : m_lock(unlocked) {}
 
 			void lock() {
 				if (try_lock_once(pause_cpu)) {
@@ -100,18 +86,8 @@ namespace concurrencpp {
 				while (try_lock_once([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }) == false);
 			}
 
-			void unlock() noexcept { 
-				assert(m_lock.load(std::memory_order_acquire) == locked);
-				m_lock.store(unlocked, std::memory_order_release); 
-			}
-
-			bool try_lock() noexcept {
-				return std::atomic_exchange_explicit(
-					&m_lock,
-					true,
-					std::memory_order_acquire) == unlocked;
-			}
-
+			inline void unlock() noexcept { locked.clear(); }
+			inline bool try_lock() noexcept { return locked.test_and_set(std::memory_order_acquire) == false; }
 		};
 
 		class recursive_spinlock {
